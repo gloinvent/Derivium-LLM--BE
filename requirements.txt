@@ -1,0 +1,26 @@
+# --- Core application ---
+streamlit>=1.38.0
+pymupdf4llm>=0.0.12
+langchain>=0.3.2
+langchain-community>=0.3.2
+langchain-openai>=0.1.14
+pydantic==2.12.2
+typing-extensions==4.15.0
+django>=4.0
+
+# --- Embeddings / NLP ---
+rank-bm25>=0.2.2
+
+# --- Vector database ---
+faiss-cpu>=1.8.0
+
+# --- Utilities ---
+numpy>=1.26.4
+tqdm>=4.66.5
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# --- OCR / Image Processing ---
+pytesseract>=0.3.13
+Pillow>=10.0.0
+opencv-python-headless>=4.8.1
