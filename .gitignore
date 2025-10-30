@@ -1,2 +1,9 @@
 venv/
 .env
+pdf_chat_project/media/faiss_indexes/
+pdf_chat_project/media/pdfs/
+pdf_chat_project/db.sqlite3
+pdf_chat_project/__pycache__/
+pdf_chat_project/chat_app/__pycache__/
+pdf_chat_project/pdf_chat_project/__pycache__/
+requirements.txt
