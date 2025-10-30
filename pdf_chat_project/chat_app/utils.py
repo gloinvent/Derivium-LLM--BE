@@ -190,7 +190,7 @@ def get_pdf_s3_path(pdf_filename_in_db: str) -> str:
 
 
 
-def download_pdf_from_s3_to_temp(s3_object_name: str) -> str | None:
+def download_pdf_from_s3_to_temp(s3_object_name: str):
     """Downloads a PDF from S3 to a temporary local file and returns its path."""
     s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
     print(f"DEBUG (utils.py - download_pdf_from_s3_to_temp): Attempting to download PDF '{s3_object_name}' from S3 bucket '{s3_bucket}' to temporary file.")
