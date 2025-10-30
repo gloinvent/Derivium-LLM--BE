@@ -11,6 +11,11 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+import os
+from dotenv import dotenv_values
+
+# Load environment variables from .env file
+env_vars = dotenv_values(Path(__file__).resolve().parent.parent / ".env")
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,12 +25,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-ov8^_j4cm4bx-cxcvm2ate+7lq4x+ok4w2f_6beh57(^h!ey4$'
+SECRET_KEY = env_vars.get('SECRET_KEY', 'django-insecure-ov8^_j4cm4bx-cxcvm2ate+7lq4x+ok4w2f_6beh57(^h!ey4$')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env_vars.get('DEBUG', 'False').lower() == 'true'
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env_vars.get('ALLOWED_HOSTS', '').split(',')
+if '' in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.remove('')
+
+# Determine environment
+ENVIRONMENT = env_vars.get('ENVIRONMENT', 'UAT_LOCAL')
 
 
 # Application definition
@@ -38,6 +48,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'chat_app',
+    'storages', # Added for S3 storage
 ]
 
 MIDDLEWARE = [
@@ -116,8 +127,29 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
-MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+
+# Conditional AWS S3 settings
+if ENVIRONMENT == 'UAT_AWS':
+    AWS_ACCESS_KEY_ID = env_vars.get('AWS_ACCESS_KEY_ID')
+    AWS_SECRET_ACCESS_KEY = env_vars.get('AWS_SECRET_ACCESS_KEY')
+    AWS_STORAGE_BUCKET_NAME = env_vars.get('AWS_STORAGE_BUCKET_NAME')
+    AWS_S3_REGION_NAME = env_vars.get('AWS_S3_REGION_NAME')
+    # AWS_S3_ENDPOINT_URL = env_vars.get('AWS_S3_ENDPOINT_URL') # Optional
+
+    DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
+    AWS_LOCATION = 'media' # All files will be stored under this prefix in the S3 bucket
+    MEDIA_URL = f'https://{AWS_STORAGE_BUCKET_NAME}.s3.{AWS_S3_REGION_NAME}.amazonaws.com/{AWS_LOCATION}/'
+    AWS_S3_FILE_OVERWRITE = False # Prevent overwriting files with the same name
+    AWS_DEFAULT_ACL = None # Or 'public-read' if files should be publicly accessible
+    AWS_QUERYSTRING_AUTH = False # Don't add query parameters to S3 URLs
+
+    # Ensure media root is still defined for local operations if needed, though S3 will handle storage
+    MEDIA_ROOT = BASE_DIR / 'media_local_cache' # Use a local cache for media if needed
+    print(f"DEBUG: DEFAULT_FILE_STORAGE is set to {DEFAULT_FILE_STORAGE}") # Added debug print
+else: # UAT_LOCAL
+    MEDIA_URL = '/media/'
+    MEDIA_ROOT = BASE_DIR / 'media'
+    print(f"DEBUG: DEFAULT_FILE_STORAGE is set to {MEDIA_ROOT}") # Added debug print
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

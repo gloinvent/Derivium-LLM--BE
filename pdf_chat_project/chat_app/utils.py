@@ -6,11 +6,14 @@ import asyncio
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import logging
 import time
-import pickle # Added for serializing BM25
-import json # Added for serializing docs and tokenized_texts
+import pickle
+import json
 
 import openai
 from dotenv import load_dotenv
+from django.conf import settings # Import Django settings
+import boto3 # For AWS S3 interaction
+from botocore.exceptions import ClientError # For handling S3 errors
 
 # PDF parsing - optimized imports
 import pymupdf4llm
@@ -48,10 +51,87 @@ CHUNK_OVERLAP = 150
 TOP_K = 10  # Retrieve more initially for reranking
 TOP_K_FINAL = 3  # Final number after reranking
 
-INDEX_DIR = "faiss_index_dir" # This will need to be adjusted for Django's MEDIA_ROOT
+INDEX_DIR = "faiss_index_dir" # Default local directory. Will be relative to MEDIA_ROOT.
 
 # OCR optimization
 TESSERACT_CONFIG = r'--oem 3 --psm 3 -c preserve_interword_spaces=1 tessedit_do_invert=0'
+
+# -------------------------
+# AWS S3 Helpers
+# -------------------------
+def get_s3_client():
+    """Returns an S3 client configured with Django settings."""
+    return boto3.client(
+        's3',
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        region_name=settings.AWS_S3_REGION_NAME
+    )
+
+def s3_upload_file(file_content: bytes, bucket: str, object_name: str):
+    """Uploads a file to an S3 bucket."""
+    s3_client = get_s3_client()
+    try:
+        logger.info(f"Attempting to upload {object_name} to s3://{bucket}")
+        s3_client.put_object(Bucket=bucket, Key=object_name, Body=file_content)
+        logger.info(f"Successfully uploaded {object_name} to s3://{bucket}")
+        return True
+    except ClientError as e:
+        logger.error(f"Error uploading {object_name} to s3://{bucket}: {e}")
+        return False
+
+def s3_download_file(bucket: str, object_name: str) -> bytes | None:
+    """Downloads a file from an S3 bucket."""
+    s3_client = get_s3_client()
+    try:
+        logger.info(f"Attempting to download {object_name} from s3://{bucket}")
+        response = s3_client.get_object(Bucket=bucket, Key=object_name)
+        logger.info(f"Successfully downloaded {object_name} from s3://{bucket}")
+        return response['Body'].read()
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            logger.warning(f"Object {object_name} not found in s3://{bucket}")
+        else:
+            logger.error(f"Error downloading {object_name} from s3://{bucket}: {e}")
+        return None
+
+def s3_file_exists(bucket: str, object_name: str) -> bool:
+    """Checks if a file exists in an S3 bucket."""
+    s3_client = get_s3_client()
+    try:
+        logger.info(f"Checking existence of {object_name} in s3://{bucket}")
+        s3_client.head_object(Bucket=bucket, Key=object_name)
+        logger.info(f"Object {object_name} found in s3://{bucket}")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            logger.warning(f"Object {object_name} not found in s3://{bucket} (404 Not Found).")
+            return False
+        logger.error(f"Error checking existence of {object_name} in s3://{bucket}: {e}")
+        return False
+
+def get_faiss_index_s3_path(pdf_id: int, filename: str) -> str:
+    """Generates the S3 path for FAISS index related files, including AWS_LOCATION."""
+    return os.path.join(settings.AWS_LOCATION, f"faiss_indexes/{pdf_id}/{filename}").replace(os.sep, '/')
+
+def get_pdf_s3_path(pdf_filename_in_db: str) -> str:
+    """
+    Generates the full S3 object key for PDF files,
+    combining AWS_LOCATION and the filename from the database.
+    """
+    return os.path.join(settings.AWS_LOCATION, pdf_filename_in_db).replace(os.sep, '/')
+
+def download_pdf_from_s3_to_temp(s3_object_name: str) -> str | None:
+    """Downloads a PDF from S3 to a temporary local file and returns its path."""
+    s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+    pdf_data = s3_download_file(s3_bucket, s3_object_name)
+    if pdf_data:
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        temp_file.write(pdf_data)
+        temp_file.close()
+        logger.info(f"Downloaded S3 object {s3_object_name} to temporary file {temp_file.name}")
+        return temp_file.name
+    return None
 
 # Parallel processing settings
 MAX_WORKERS = min(8, os.cpu_count() or 4)
@@ -60,6 +140,25 @@ EMBEDDING_BATCH_SIZE = 100
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# -------------------------
+# S3 Waiter
+# -------------------------
+async def wait_for_s3_file(bucket: str, object_name: str, max_attempts: int = 15, initial_delay: float = 2.0) -> bool:
+    """
+    Waits for an S3 file to become available with exponential backoff.
+    """
+    for attempt in range(max_attempts):
+        if await asyncio.to_thread(s3_file_exists, bucket, object_name):
+            logger.info(f"S3 file {object_name} found after {attempt + 1} attempts.")
+            return True
+        
+        delay = initial_delay * (2 ** attempt)
+        logger.warning(f"S3 file {object_name} not found (attempt {attempt + 1}/{max_attempts}). Retrying in {delay:.2f}s...")
+        await asyncio.sleep(delay)
+    
+    logger.error(f"S3 file {object_name} not found after {max_attempts} attempts.")
+    return False
 
 # -------------------------
 # Model loaders (without Streamlit caching)
@@ -151,47 +250,75 @@ def process_page_batch(args: Tuple[str, List[int]]) -> List[Tuple[int, str]]:
 
     return results
 
-async def parse_pdf_ultra_fast(file_path: str) -> List[Tuple[int, str]]:
-    """Ultra-fast PDF parsing with optimal parallelization."""
+async def parse_pdf_ultra_fast(pdf_document_instance) -> List[Tuple[int, str]]:
+    """
+    Ultra-fast PDF parsing with optimal parallelization,
+    handling both local and S3 PDF files.
+    """
     start_time = time.time()
+    
+    file_path = None
+    temp_file_path = None
 
-    with fitz.open(file_path) as doc:
-        total_pages = doc.page_count
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        # Use the utility function to get the correct S3 object key
+        s3_object_name = get_pdf_s3_path(pdf_document_instance.file.name)
+        logger.info(f"Attempting to download S3 object: {s3_object_name}")
+        temp_file_path = download_pdf_from_s3_to_temp(s3_object_name)
+        if not temp_file_path:
+            logger.error(f"Failed to download PDF from S3: {s3_object_name}")
+            return []
+        file_path = temp_file_path
+    else:
+        file_path = pdf_document_instance.file.path # Local file path
 
-        # Create page batches for parallel processing
-        page_batches = []
-        batch_size = max(1, total_pages // MAX_WORKERS)
+    if not file_path or not os.path.exists(file_path):
+        logger.error(f"PDF file not found locally: {file_path}")
+        return []
 
-        for i in range(0, total_pages, batch_size):
-            page_batches.append((file_path, list(range(i, min(i + batch_size, total_pages)))))
+    try:
+        with fitz.open(file_path) as doc:
+            total_pages = doc.page_count
 
-        # Process batches in parallel
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            loop = asyncio.get_event_loop()
-            tasks = [
-                loop.run_in_executor(executor, process_page_batch, batch)
-                for batch in page_batches
-            ]
-            batch_results = await asyncio.gather(*tasks)
+            # Create page batches for parallel processing
+            page_batches = []
+            batch_size = max(1, total_pages // MAX_WORKERS)
 
-        # Flatten results
-        all_results = []
-        for batch in batch_results:
-            all_results.extend(batch)
+            for i in range(0, total_pages, batch_size):
+                page_batches.append((file_path, list(range(i, min(i + batch_size, total_pages)))))
 
-        # Sort by page number
-        all_results.sort(key=lambda x: x[0])
+            # Process batches in parallel
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                loop = asyncio.get_event_loop()
+                tasks = [
+                    loop.run_in_executor(executor, process_page_batch, batch)
+                    for batch in page_batches
+                ]
+                batch_results = await asyncio.gather(*tasks)
 
-        parsing_time = time.time() - start_time
-        logger.info(f"PDF parsed {total_pages} pages in {parsing_time:.2f}s")
+            # Flatten results
+            all_results = []
+            for batch in batch_results:
+                all_results.extend(batch)
 
-        return all_results
+            # Sort by page number
+            all_results.sort(key=lambda x: x[0])
+
+            parsing_time = time.time() - start_time
+            logger.info(f"PDF parsed {total_pages} pages in {parsing_time:.2f}s")
+
+            return all_results
+    finally:
+        # Clean up temporary file if it was downloaded from S3
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+            logger.info(f"Cleaned up temporary PDF file: {temp_file_path}")
 
 # -------------------------
 # Optimized Document Processing
 # -------------------------
 
-def chunk_documents_ultra_fast(pages_markdown: List[Tuple[int, str]], source: str = "uploaded.pdf") -> List[Document]:
+def chunk_documents_ultra_fast(pages_markdown: List[Tuple[int, str]], pdf_id: int, source: str = "uploaded.pdf") -> List[Document]:
     """Ultra-fast document chunking with minimal overhead."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -216,7 +343,8 @@ def chunk_documents_ultra_fast(pages_markdown: List[Tuple[int, str]], source: st
                 "page": page_num + 1,
                 "chunk": i,
                 "chunk_length": len(chunk),
-                "text_hash": hash(chunk)  # For deduplication
+                "text_hash": hash(chunk),  # For deduplication
+                "pdf_id": pdf_id # Add pdf_id to metadata
             }
             docs.append(Document(page_content=chunk, metadata=metadata))
 
@@ -231,8 +359,12 @@ def chunk_documents_ultra_fast(pages_markdown: List[Tuple[int, str]], source: st
 
     return unique_docs
 
-def build_vector_store_with_batching(_docs: List[Document], index_path: str = INDEX_DIR) -> FAISS:
+def build_vector_store_with_batching(_docs: List[Document], pdf_id: int, index_path: str = INDEX_DIR) -> FAISS:
     """FAISS index building with proper batching to avoid token limits."""
+    if not _docs:
+        logger.warning("Empty document list, cannot build vector store.")
+        return None
+
     embeddings = load_embedding_model()
 
     try:
@@ -245,8 +377,26 @@ def build_vector_store_with_batching(_docs: List[Document], index_path: str = IN
             raise e
 
     # Save index
-    os.makedirs(index_path, exist_ok=True)
-    vectorstore.save_local(index_path)
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        # Save to a temporary local directory first, then upload to S3
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vectorstore.save_local(tmpdir)
+            s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+            # pdf_id is now passed directly
+            if not pdf_id:
+                logger.error("PDF ID not found for S3 upload.")
+                raise ValueError("PDF ID is required for S3 FAISS index path.")
+
+            # Upload each file from the temporary directory to S3
+            for root, _, files in os.walk(tmpdir):
+                for file in files:
+                    local_file_path = os.path.join(root, file)
+                    s3_object_name = get_faiss_index_s3_path(pdf_id, file)
+                    with open(local_file_path, 'rb') as f:
+                        s3_upload_file(f.read(), s3_bucket, s3_object_name)
+    else:
+        os.makedirs(index_path, exist_ok=True)
+        vectorstore.save_local(index_path)
 
     return vectorstore
 
@@ -300,54 +450,123 @@ def _build_faiss_manual_batching(docs: List[Document], embeddings, index_path: s
 
     return vectorstore
 
-def build_vector_store_fast(_docs: List[Document], index_path: str = INDEX_DIR) -> FAISS_CLASS:
+def build_vector_store_fast(_docs: List[Document], pdf_id: int, index_path: str = INDEX_DIR) -> FAISS_CLASS:
     """Fast FAISS index building with batching."""
-    return build_vector_store_with_batching(_docs, index_path)
+    return build_vector_store_with_batching(_docs, pdf_id, index_path)
 
-def load_faiss_vector_store(index_path: str) -> FAISS_CLASS:
+def load_faiss_vector_store(pdf_id: int, index_path: str) -> FAISS_CLASS:
     """Load FAISS index with dangerous deserialization allowed for trusted sources."""
     embeddings = load_embedding_model()
-    # Resolve the path to handle any potential issues with spaces or relative paths
-    resolved_index_path = Path(index_path).resolve()
-    return FAISS_CLASS.load_local(str(resolved_index_path), embeddings, allow_dangerous_deserialization=True)
 
-def save_bm25_object(bm25_obj: BM25Okapi, path: str):
-    """Saves a BM25Okapi object to disk using pickle."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'wb') as f:
-        pickle.dump(bm25_obj, f)
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        # Download FAISS index files from S3 to a temporary local directory
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # FAISS typically saves 2 files: index.faiss and index.pkl
+            # We also save bm25.pkl, docs.json, tokenized_texts.json
+            faiss_file_s3_path = get_faiss_index_s3_path(pdf_id, "index.faiss")
+            pkl_file_s3_path = get_faiss_index_s3_path(pdf_id, "index.pkl")
 
-def load_bm25_object(path: str) -> BM25Okapi:
-    """Loads a BM25Okapi object from disk using pickle."""
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+            faiss_data = s3_download_file(s3_bucket, faiss_file_s3_path)
+            pkl_data = s3_download_file(s3_bucket, pkl_file_s3_path)
 
-def save_tokenized_texts(tokenized_texts: List[str], path: str):
-    """Saves tokenized texts to disk as JSON."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(tokenized_texts, f, ensure_ascii=False, indent=2)
+            if faiss_data is None or pkl_data is None:
+                logger.error(f"Could not download all FAISS index files for PDF ID {pdf_id} from S3.")
+                return None
 
-def load_tokenized_texts(path: str) -> List[str]:
-    """Loads tokenized texts from disk as JSON."""
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+            with open(os.path.join(tmpdir, "index.faiss"), 'wb') as f:
+                f.write(faiss_data)
+            with open(os.path.join(tmpdir, "index.pkl"), 'wb') as f:
+                f.write(pkl_data)
+            
+            # Load from the temporary local directory
+            return FAISS_CLASS.load_local(tmpdir, embeddings, allow_dangerous_deserialization=True)
+    else:
+        # Resolve the path to handle any potential issues with spaces or relative paths
+        resolved_index_path = Path(index_path).resolve()
+        return FAISS_CLASS.load_local(str(resolved_index_path), embeddings, allow_dangerous_deserialization=True)
 
-def save_docs(docs: List[Document], path: str):
-    """Saves a list of Document objects to disk as JSON."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+def save_bm25_object(bm25_obj: BM25Okapi, pdf_id: int, path: str):
+    """Saves a BM25Okapi object to disk using pickle, or to S3."""
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        s3_object_name = get_faiss_index_s3_path(pdf_id, "bm25.pkl")
+        with tempfile.TemporaryFile(mode='wb+') as tmp_file:
+            pickle.dump(bm25_obj, tmp_file)
+            tmp_file.seek(0)
+            s3_upload_file(tmp_file.read(), s3_bucket, s3_object_name)
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump(bm25_obj, f)
+
+def load_bm25_object(pdf_id: int, path: str) -> BM25Okapi:
+    """Loads a BM25Okapi object from disk using pickle, or from S3."""
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        s3_object_name = get_faiss_index_s3_path(pdf_id, "bm25.pkl")
+        data = s3_download_file(s3_bucket, s3_object_name)
+        if data:
+            return pickle.loads(data)
+        return None
+    else:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+
+def save_tokenized_texts(tokenized_texts: List[str], pdf_id: int, path: str):
+    """Saves tokenized texts to disk as JSON, or to S3."""
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        s3_object_name = get_faiss_index_s3_path(pdf_id, "tokenized_texts.json")
+        s3_upload_file(json.dumps(tokenized_texts, ensure_ascii=False, indent=2).encode('utf-8'), s3_bucket, s3_object_name)
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(tokenized_texts, f, ensure_ascii=False, indent=2)
+
+def load_tokenized_texts(pdf_id: int, path: str) -> List[str]:
+    """Loads tokenized texts from disk as JSON, or from S3."""
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        s3_object_name = get_faiss_index_s3_path(pdf_id, "tokenized_texts.json")
+        data = s3_download_file(s3_bucket, s3_object_name)
+        if data:
+            return json.loads(data.decode('utf-8'))
+        return []
+    else:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+def save_docs(docs: List[Document], pdf_id: int, path: str):
+    """Saves a list of Document objects to disk as JSON, or to S3."""
     serializable_docs = [{
         "page_content": doc.page_content,
         "metadata": doc.metadata
     } for doc in docs]
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(serializable_docs, f, ensure_ascii=False, indent=2)
+    
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        s3_object_name = get_faiss_index_s3_path(pdf_id, "docs.json")
+        s3_upload_file(json.dumps(serializable_docs, ensure_ascii=False, indent=2).encode('utf-8'), s3_bucket, s3_object_name)
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_docs, f, ensure_ascii=False, indent=2)
 
-def load_docs(path: str) -> List[Document]:
-    """Loads a list of Document objects from disk (JSON)."""
-    with open(path, 'r', encoding='utf-8') as f:
-        serializable_docs = json.load(f)
-    return [Document(page_content=d["page_content"], metadata=d["metadata"]) for d in serializable_docs]
+def load_docs(pdf_id: int, path: str) -> List[Document]:
+    """Loads a list of Document objects from disk (JSON), or from S3."""
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        s3_object_name = get_faiss_index_s3_path(pdf_id, "docs.json")
+        data = s3_download_file(s3_bucket, s3_object_name)
+        if data:
+            serializable_docs = json.loads(data.decode('utf-8'))
+            return [Document(page_content=d["page_content"], metadata=d["metadata"]) for d in serializable_docs]
+        return []
+    else:
+        with open(path, 'r', encoding='utf-8') as f:
+            serializable_docs = json.load(f)
+        return [Document(page_content=d["page_content"], metadata=d["metadata"]) for d in serializable_docs]
 
 def build_bm25_fast(docs: List[Document]) -> Tuple[BM25Okapi, List[str]]:
     """Optimized BM25 corpus building."""
@@ -359,6 +578,10 @@ def build_bm25_fast(docs: List[Document]) -> Tuple[BM25Okapi, List[str]]:
         if len(tokens) > 3:
             tokenized_corpus.append(tokens)
             clean_texts.append(" ".join(tokens))
+
+    if not tokenized_corpus:
+        logger.warning("Empty tokenized_corpus, cannot build BM25 index.")
+        return None, [] # Return None for bm25_obj and empty list for clean_texts
 
     bm25 = BM25Okapi(tokenized_corpus)
     return bm25, clean_texts

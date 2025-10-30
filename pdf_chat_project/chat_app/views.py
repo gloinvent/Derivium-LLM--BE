@@ -14,6 +14,7 @@ from django.conf import settings
 from django.core.files.storage import FileSystemStorage
 from django.views.decorators.http import require_POST, require_GET
 from asgiref.sync import sync_to_async
+from botocore.exceptions import ClientError
 
 from .models import PDFDocument, ChatHistory
 from .utils import (
@@ -30,9 +31,14 @@ from .utils import (
     save_tokenized_texts,
     load_tokenized_texts,
     save_docs,
-    load_docs
+    load_docs,
+    get_faiss_index_s3_path, # For S3 path generation
+    get_s3_client, # For S3 deletion
+    s3_file_exists, # For checking S3 file existence
+    wait_for_s3_file # For waiting on S3 file availability
 )
 from langchain_core.documents import Document
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -53,38 +59,57 @@ async def upload_pdf(request):
         return JsonResponse({'status': 'error', 'message': 'No PDF file uploaded.'}, status=400)
 
     uploaded_file = request.FILES['pdf_file']
-    fs = FileSystemStorage(location=settings.MEDIA_ROOT)
 
-    # Save the uploaded file temporarily
-    filename = await sync_to_async(fs.save)(uploaded_file.name, uploaded_file)
-    pdf_path = os.path.join(settings.MEDIA_ROOT, filename)
+    # Create a new PDFDocument instance without saving the file yet
+    pdf_doc = await sync_to_async(PDFDocument.objects.create)(
+        filename=uploaded_file.name,
+        processed=False
+    )
+    logger.info(f"PDFDocument instance created (ID: {pdf_doc.id}).")
+
+    # Assign the uploaded file to the FileField and save to trigger storage backend
+    pdf_doc.file = uploaded_file
+    await sync_to_async(pdf_doc.save)()
+    logger.info(f"PDFDocument saved. File name in DB: {pdf_doc.file.name}, URL: {pdf_doc.file.url}") # Log S3 object key and URL
+    
+    if settings.ENVIRONMENT == 'UAT_AWS':
+        s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        logger.info(f"Using S3 bucket: {s3_bucket}")
+
+        # Use django-storages's own storage backend to check for file existence
+        # This is more reliable as it uses the same logic that handled the upload.
+        # The pdf_doc.file.name already contains the path relative to the bucket root (e.g., 'pdfs/filename.pdf')
+        storage_exists = await sync_to_async(pdf_doc.file.storage.exists)(pdf_doc.file.name)
+        
+        if not storage_exists:
+            logger.error(f"S3 upload failed: File {pdf_doc.file.name} not found by storage backend in bucket {s3_bucket}.")
+            await sync_to_async(pdf_doc.delete)() # Clean up DB entry
+            return JsonResponse({'status': 'error', 'message': 'Failed to upload PDF to S3.'}, status=500)
+        logger.info(f"S3 upload confirmed for {pdf_doc.file.name} using storage.exists().")
 
     try:
-        # Create a new PDFDocument entry
-        pdf_doc = await sync_to_async(PDFDocument.objects.create)(
-            file=filename,
-            filename=uploaded_file.name,
-            processed=False
-        )
-
-        # Asynchronous processing
         start_total = time.time()
 
-        # 1. Fast PDF parsing
-        pages_markdown = await parse_pdf_ultra_fast(pdf_path)
+        # 1. Fast PDF parsing (utils.parse_pdf_ultra_fast now handles S3 download internally)
+        pages_markdown = await parse_pdf_ultra_fast(pdf_doc)
         pdf_doc.num_pages = len(pages_markdown)
 
         # 2. Fast chunking with deduplication
-        docs = chunk_documents_ultra_fast(pages_markdown, source=uploaded_file.name)
+        docs = chunk_documents_ultra_fast(pages_markdown, pdf_doc.id, source=uploaded_file.name)
         pdf_doc.num_chunks = len(docs)
 
         # 3. Parallel indexing
-        # Use a unique index directory for each PDF, replacing spaces for FAISS compatibility
-        index_dir_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id)).replace(" ", "_")
+        # Determine the base path for index files (local or S3 object key prefix)
+        if settings.ENVIRONMENT == 'UAT_AWS':
+            # For S3, paths are object keys, not file system paths
+            index_base_path = f"faiss_indexes/{pdf_doc.id}"
+        else:
+            # For local, use MEDIA_ROOT
+            index_base_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id)).replace(" ", "_")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             bm25_future = executor.submit(build_bm25_fast, docs)
-            vector_future = executor.submit(build_vector_store_fast, docs, index_dir_path)
+            vector_future = executor.submit(build_vector_store_fast, docs, pdf_doc.id, index_base_path)
 
             bm25_obj, tokenized_texts = await sync_to_async(bm25_future.result)()
             vectorstore = await sync_to_async(vector_future.result)()
@@ -93,16 +118,20 @@ async def upload_pdf(request):
         pdf_doc.processing_time = total_time
         pdf_doc.processed = True
         await sync_to_async(pdf_doc.save)()
+        logger.info(f"PDFDocument saved. File URL: {pdf_doc.file.url}") # Log file URL
 
-        # Define paths for persistent storage
-        bm25_file_path = os.path.join(index_dir_path, 'bm25.pkl')
-        tokenized_texts_file_path = os.path.join(index_dir_path, 'tokenized_texts.json')
-        docs_file_path = os.path.join(index_dir_path, 'docs.json')
+        if not pages_markdown:
+            raise ValueError("PDF parsing resulted in no content.")
 
-        # Save BM25, tokenized_texts, and docs to disk
-        await sync_to_async(save_bm25_object)(bm25_obj, bm25_file_path)
-        await sync_to_async(save_tokenized_texts)(tokenized_texts, tokenized_texts_file_path)
-        await sync_to_async(save_docs)(docs, docs_file_path)
+        # Define paths for persistent storage (these will be S3 object keys or local paths)
+        bm25_file_path = os.path.join(index_base_path, 'bm25.pkl')
+        tokenized_texts_file_path = os.path.join(index_base_path, 'tokenized_texts.json')
+        docs_file_path = os.path.join(index_base_path, 'docs.json')
+
+        # Save BM25, tokenized_texts, and docs using the updated utility functions
+        await sync_to_async(save_bm25_object)(bm25_obj, pdf_doc.id, bm25_file_path)
+        await sync_to_async(save_tokenized_texts)(tokenized_texts, pdf_doc.id, tokenized_texts_file_path)
+        await sync_to_async(save_docs)(docs, pdf_doc.id, docs_file_path)
 
         # Update PDFDocument with paths
         pdf_doc.bm25_path = bm25_file_path
@@ -129,9 +158,22 @@ async def upload_pdf(request):
 
     except Exception as e:
         logger.error(f"Error processing PDF: {e}", exc_info=True)
-        # Clean up the uploaded file if processing fails
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
+        # Clean up the uploaded file if processing fails (only for local storage)
+        try:
+            if settings.ENVIRONMENT != 'UAT_AWS':
+                # If a local file was saved to the model's FileField, remove it
+                if 'pdf_doc' in locals() and getattr(pdf_doc, 'file', None):
+                    try:
+                        local_path = getattr(pdf_doc.file, 'path', None)
+                        if local_path and os.path.exists(local_path):
+                            os.remove(local_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # If an error occurs after pdf_doc is created, ensure it's deleted
+        if 'pdf_doc' in locals() and pdf_doc.pk:
+            await sync_to_async(pdf_doc.delete)()
         return JsonResponse({'status': 'error', 'message': f'Error processing PDF: {e}'}, status=500)
 
 @require_POST
@@ -154,10 +196,21 @@ async def chat(request):
         if not data:
             if pdf_doc.bm25_path and pdf_doc.tokenized_texts_path and pdf_doc.docs_path:
                 try:
-                    vectorstore = await sync_to_async(load_faiss_vector_store)(os.path.dirname(pdf_doc.bm25_path))
-                    bm25_obj = await sync_to_async(load_bm25_object)(pdf_doc.bm25_path)
-                    tokenized_texts = await sync_to_async(load_tokenized_texts)(pdf_doc.tokenized_texts_path)
-                    docs = await sync_to_async(load_docs)(pdf_doc.docs_path)
+                    # Pass pdf_id to loading functions
+                    # For FAISS, the path is the directory containing index.faiss and index.pkl
+                    # For S3, load_faiss_vector_store uses pdf_id to construct S3 paths
+                    # For FAISS, the path is the directory containing index.faiss and index.pkl for local storage.
+                    # For S3, load_faiss_vector_store uses pdf_id to construct S3 paths internally, so index_path can be an empty string.
+                    vectorstore = await sync_to_async(load_faiss_vector_store)(
+                        pdf_doc.id,
+                        os.path.dirname(pdf_doc.bm25_path) if settings.ENVIRONMENT != 'UAT_AWS' else ""
+                    )
+                    bm25_obj = await sync_to_async(load_bm25_object)(pdf_doc.id, pdf_doc.bm25_path)
+                    tokenized_texts = await sync_to_async(load_tokenized_texts)(pdf_doc.id, pdf_doc.tokenized_texts_path)
+                    docs = await sync_to_async(load_docs)(pdf_doc.id, pdf_doc.docs_path)
+
+                    if vectorstore is None or bm25_obj is None or not tokenized_texts or not docs:
+                        raise ValueError("Failed to load all processed data components.")
 
                     # Store in memory for subsequent requests
                     processed_data_store[pdf_doc.id] = {
@@ -167,10 +220,10 @@ async def chat(request):
                         "tokenized_texts": tokenized_texts,
                     }
                 except Exception as e:
-                    logger.error(f"Error loading processed data from disk for PDF {pdf_id}: {e}", exc_info=True)
+                    logger.error(f"Error loading processed data from disk/S3 for PDF {pdf_id}: {e}", exc_info=True)
                     return JsonResponse({'status': 'error', 'message': f'Error loading processed data: {e}'}, status=500)
             else:
-                return JsonResponse({'status': 'error', 'message': 'Processed data not found (neither in memory nor on disk).'}, status=404)
+                return JsonResponse({'status': 'error', 'message': 'Processed data paths not found in PDFDocument.'}, status=404)
 
         docs = processed_data_store[pdf_doc.id]["docs"]
         vectorstore = processed_data_store[pdf_doc.id]["vectorstore"]
@@ -321,28 +374,52 @@ async def clear_data(request):
 
         # Delete all PDF documents and their associated files/indexes
         pdf_docs_to_delete = await sync_to_async(list)(PDFDocument.objects.all())
+        s3_client = None
+        if settings.ENVIRONMENT == 'UAT_AWS':
+            s3_client = get_s3_client()
+            s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+
         for pdf_doc in pdf_docs_to_delete:
-            # Delete PDF file
+            # Delete PDF file from storage (local or S3)
             if pdf_doc.file:
                 await sync_to_async(pdf_doc.file.delete)(save=False) # delete file from storage
 
-            # Delete FAISS index directory
-            index_dir_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id))
-            if os.path.isdir(index_dir_path):
-                import shutil
-                await sync_to_async(shutil.rmtree)(index_dir_path)
+            # Delete FAISS index and related files
+            if settings.ENVIRONMENT == 'UAT_AWS' and s3_client:
+                # List and delete all objects under the PDF's FAISS index prefix
+                prefix = f"faiss_indexes/{pdf_doc.id}/"
+                try:
+                    response = await sync_to_async(s3_client.list_objects_v2)(Bucket=s3_bucket, Prefix=prefix)
+                    if 'Contents' in response:
+                        objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+                        if objects_to_delete:
+                            await sync_to_async(s3_client.delete_objects)(
+                                Bucket=s3_bucket,
+                                Delete={'Objects': objects_to_delete, 'Quiet': True}
+                            )
+                            logger.info(f"Deleted S3 objects for PDF ID {pdf_doc.id} under prefix {prefix}")
+                except Exception as e:
+                    logger.error(f"Error deleting S3 objects for PDF ID {pdf_doc.id}: {e}")
+            else:
+                # Local deletion
+                index_dir_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id))
+                if os.path.isdir(index_dir_path):
+                    import shutil
+                    await sync_to_async(shutil.rmtree)(index_dir_path)
+                    logger.info(f"Deleted local FAISS index directory: {index_dir_path}")
 
         await sync_to_async(PDFDocument.objects.all().delete)()
         await sync_to_async(ChatHistory.objects.all().delete)()
 
-        # Clear media root directories if empty
-        media_root = settings.MEDIA_ROOT
-        if os.path.exists(media_root) and not os.listdir(media_root):
-            await sync_to_async(os.rmdir)(media_root)
+        # Clear local media root directories if empty (only relevant for UAT_LOCAL)
+        if settings.ENVIRONMENT != 'UAT_AWS':
+            media_root = settings.MEDIA_ROOT
+            if os.path.exists(media_root) and not os.listdir(media_root):
+                await sync_to_async(os.rmdir)(media_root)
 
-        faiss_indexes_root = os.path.join(media_root, 'faiss_indexes')
-        if os.path.exists(faiss_indexes_root) and not os.listdir(faiss_indexes_root):
-            await sync_to_async(os.rmdir)(faiss_indexes_root)
+            faiss_indexes_root = os.path.join(media_root, 'faiss_indexes')
+            if os.path.exists(faiss_indexes_root) and not os.listdir(faiss_indexes_root):
+                await sync_to_async(os.rmdir)(faiss_indexes_root)
 
         return JsonResponse({'status': 'success', 'message': 'All data and cache cleared.'})
     except Exception as e:

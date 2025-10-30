@@ -102,7 +102,7 @@
 
                     <hr>
 
-                    <h5 class="mt-4">Management</h5>
+                    <h5 class="mt-4"></h5>
                     <button class="btn btn-danger w-100" id="clearDataBtn">Clear All Data & Cache</button>
                 </div>
             </div>
@@ -111,9 +111,6 @@
                     <h2 class="mb-4" id="chatTitle">Select a PDF to chat</h2>
 
                     <div id="chatInterface" style="display: none;">
-                        <div class="chat-container" id="chatHistory">
-                            <!-- Chat messages will be loaded here -->
-                        </div>
 
                         <div class="input-group mb-3">
                             <input type="text" class="form-control" placeholder="Ask about the PDF content..." id="chatQueryInput">
@@ -124,7 +121,7 @@
 
                         <div class="row mt-4">
                             <div class="col-md-6">
-                                <h4 class="mb-3">📄 Retrieved Context (Reranked)</h4>
+                                <h4 class="mb-3">📄 OPTIONAL ANSWERS</h4>
                                 <div id="retrievedContext" class="mb-3">
                                     <!-- Retrieved context will be displayed here -->
                                 </div>
@@ -134,14 +131,10 @@
                                 <div id="aiResponse">
                                     <!-- AI response will be displayed here -->
                                 </div>
-                                <h4 class="mb-3 mt-4">🔍 Retrieval Info</h4>
-                                <div id="retrievalInfo">
-                                    <!-- Retrieval info will be displayed here -->
-                                </div>
                             </div>
                         </div>
                     </div>
-                                <h4 class="mb-3 mt-4">📝 Chunk Summary</h4>
+                                <h4 class="mb-3 mt-4">📝 OPTION Summary</h4>
                                 <div id="chunkSummary" class="alert alert-light" style="display: none;">
                                     <!-- Summary of selected chunk will be displayed here -->
                                 </div>
@@ -158,13 +151,11 @@
         const pdfList = document.getElementById('pdfList');
         const chatTitle = document.getElementById('chatTitle');
         const chatInterface = document.getElementById('chatInterface');
-        const chatHistoryDiv = document.getElementById('chatHistory');
         const chatQueryInput = document.getElementById('chatQueryInput');
         const getAnswerBtn = document.getElementById('getAnswerBtn');
         const chatStatus = document.getElementById('chatStatus');
         const retrievedContextDiv = document.getElementById('retrievedContext');
         const aiResponseDiv = document.getElementById('aiResponse');
-        const retrievalInfoDiv = document.getElementById('retrievalInfo');
         const chunkSummaryDiv = document.getElementById('chunkSummary');
         const clearDataBtn = document.getElementById('clearDataBtn');
 
@@ -236,6 +227,17 @@
                     `;
                     pdfList.insertAdjacentHTML('afterbegin', newPdfItem); // Add to top
                     attachPdfItemListeners(); // Re-attach listeners for new items
+
+                    // Automatically show chat interface after successful PDF processing
+                    currentPdfId = data.pdf_id;
+                    chatTitle.innerText = `Chatting with: ${file.name}`;
+                    chatInterface.style.display = 'block';
+                    // Clear previous chat results
+                    aiResponseDiv.innerHTML = '';
+                    retrievedContextDiv.innerHTML = '';
+                    chatStatus.innerHTML = '';
+                    document.getElementById('chunkSummary').style.display = 'none';
+                    document.getElementById('chunkSummary').innerHTML = '';
                 } else {
                     uploadStatus.innerHTML = `<div class="alert alert-danger">${data.message}</div>`;
                 }
@@ -260,8 +262,6 @@
             }
 
             // Display user's question
-            chatHistoryDiv.innerHTML += `<div class="chat-message user-message"><strong>You:</strong> ${query}</div>`;
-            chatHistoryDiv.scrollTop = chatHistoryDiv.scrollHeight; // Scroll to bottom
 
             chatStatus.innerHTML = `
                 <div class="alert alert-info d-flex align-items-center">
@@ -291,16 +291,8 @@
                 if (data.status === 'success') {
                     chatStatus.innerHTML = ''; // Clear status
                     // Display AI's answer
-                    chatHistoryDiv.innerHTML += `<div class="chat-message ai-message"><strong>AI:</strong> ${data.answer}</div>`;
-                    chatHistoryDiv.scrollTop = chatHistoryDiv.scrollHeight;
 
                     aiResponseDiv.innerHTML = `<p>${data.answer}</p>`;
-                    retrievalInfoDiv.innerHTML = `
-                        <div class="performance-metric"><strong>Retrieval Time:</strong> ${data.retrieval_time}</div>
-                        <div class="performance-metric"><strong>Generation Time:</strong> ${data.generation_time}</div>
-                        <div class="performance-metric"><strong>Total Chunks:</strong> ${data.context.length}</div>
-                        <div class="performance-metric"><strong>Strategy:</strong> Hybrid + Reranking</div>
-                    `;
 
                     retrievedContextDiv.innerHTML = '';
                     data.context.forEach((ctx, index) => {
@@ -310,19 +302,20 @@
                             <div class="card-header" id="headingChunk${index}">
                                 <h2 class="mb-0">
                                     <button class="btn btn-link w-100 text-start" type="button" data-bs-toggle="collapse" data-bs-target="#collapseChunk${index}" aria-expanded="false" aria-controls="collapseChunk${index}">
-                                        <strong>Chunk ${index + 1}</strong> (Pages: ${ctx.page})
+                                        <strong>Option ${index + 1}</strong> (Pages: ${ctx.page})
                                     </button>
                                 </h2>
                             </div>
                             <div id="collapseChunk${index}" class="collapse" aria-labelledby="headingChunk${index}" data-bs-parent="#retrievedContext">
                                 <div class="card-body">
                                     <p>${ctx.content}</p>
-                                    <button class="btn btn-sm btn-info mt-1 summarize-chunk-btn"
+                                    <button class="btn btn-info mt-1 summarize-chunk-btn"
+                                            style="padding: 8px 12px; font-size: 1.2em;"
                                             data-pdf-id="${currentPdfId}"
                                             data-chunk-content="${encodeURIComponent(ctx.content)}"
                                             data-chunk-page="${ctx.page}"
                                             data-query="${encodeURIComponent(query)}">
-                                        Generate Summary
+                                        👍
                                     </button>
                                 </div>
                             </div>
@@ -334,12 +327,11 @@
 
                 } else {
                     chatStatus.innerHTML = `<div class="alert alert-danger">${data.message}</div>`;
-                    chatHistoryDiv.innerHTML += `<div class="chat-message ai-message text-danger"><strong>AI Error:</strong> ${data.message}</div>`;
+                    // chatHistoryDiv.innerHTML += `<div class="chat-message ai-message text-danger"><strong>AI Error:</strong> ${data.message}</div>`;
                 }
             } catch (error) {
                 console.error('Error:', error);
                 chatStatus.innerHTML = `<div class="alert alert-danger">An unexpected error occurred: ${error.message}</div>`;
-                chatHistoryDiv.innerHTML += `<div class="chat-message ai-message text-danger"><strong>AI Error:</strong> An unexpected error occurred.</div>`;
             } finally {
                 getAnswerBtn.disabled = false;
                 chatQueryInput.disabled = false;
@@ -377,12 +369,11 @@
                     chatInterface.style.display = 'none';
                     chatTitle.innerText = 'Select a PDF to chat';
                     currentPdfId = null;
-                    chatHistoryDiv.innerHTML = '';
                     aiResponseDiv.innerHTML = '';
                     retrievedContextDiv.innerHTML = '';
-                    retrievalInfoDiv.innerHTML = '';
                     document.getElementById('chunkSummary').style.display = 'none';
                     document.getElementById('chunkSummary').innerHTML = '';
+                    pdfFile.value = ''; // Clear the file input
                 } else {
                     uploadStatus.innerHTML = `<div class="alert alert-danger">${data.message}</div>`;
                 }
@@ -394,26 +385,6 @@
             }
         });
 
-        async function loadChatHistory(pdfId) {
-            try {
-                const response = await fetch(`/history/${pdfId}/`);
-                const data = await response.json();
-
-                chatHistoryDiv.innerHTML = ''; // Clear previous history
-                if (data.status === 'success' && data.history.length > 0) {
-                    data.history.forEach(entry => {
-                        chatHistoryDiv.innerHTML += `<div class="chat-message user-message"><strong>You:</strong> ${entry.question}</div>`;
-                        chatHistoryDiv.innerHTML += `<div class="chat-message ai-message"><strong>AI:</strong> ${entry.answer}</div>`;
-                    });
-                } else {
-                    chatHistoryDiv.innerHTML = '<div class="text-muted text-center">No chat history for this PDF yet.</div>';
-                }
-                chatHistoryDiv.scrollTop = chatHistoryDiv.scrollHeight;
-            } catch (error) {
-                console.error('Error loading chat history:', error);
-                chatHistoryDiv.innerHTML = '<div class="alert alert-danger">Error loading chat history.</div>';
-            }
-        }
 
         function attachPdfItemListeners() {
             document.querySelectorAll('.pdf-item').forEach(item => {
@@ -423,11 +394,9 @@
                     const pdfName = e.target.dataset.pdfName;
                     chatTitle.innerText = `Chatting with: ${pdfName}`;
                     chatInterface.style.display = 'block';
-                    loadChatHistory(currentPdfId);
                     // Clear previous chat results when switching PDFs
                     aiResponseDiv.innerHTML = '';
                     retrievedContextDiv.innerHTML = '';
-                    retrievalInfoDiv.innerHTML = '';
                     chatStatus.innerHTML = '';
                     document.getElementById('chunkSummary').style.display = 'none';
                     document.getElementById('chunkSummary').innerHTML = '';
