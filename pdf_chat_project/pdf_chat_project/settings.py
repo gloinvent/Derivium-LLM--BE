@@ -149,7 +149,7 @@ if ENVIRONMENT == 'UAT_AWS':
 else: # UAT_LOCAL
     MEDIA_URL = '/media/'
     MEDIA_ROOT = BASE_DIR / 'media'
-    print(f"DEBUG: DEFAULT_FILE_STORAGE is set to {MEDIA_ROOT}") # Added debug print
+    print(f"DEBUG: MEDIA_ROOT is set to {MEDIA_ROOT}") # Corrected debug print
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

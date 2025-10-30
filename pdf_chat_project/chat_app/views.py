@@ -5,6 +5,7 @@ import asyncio
 import time
 import logging
 import openai
+import httpx # Import httpx
 from concurrent.futures import ThreadPoolExecutor
 
 from django.shortcuts import render, redirect
@@ -35,7 +36,8 @@ from .utils import (
     get_faiss_index_s3_path, # For S3 path generation
     get_s3_client, # For S3 deletion
     s3_file_exists, # For checking S3 file existence
-    wait_for_s3_file # For waiting on S3 file availability
+    wait_for_s3_file, # For waiting on S3 file availability
+    get_pdf_s3_path # For generating S3 path for PDF files
 )
 from langchain_core.documents import Document
 from urllib.parse import urlparse
@@ -74,38 +76,59 @@ async def upload_pdf(request):
     
     if settings.ENVIRONMENT == 'UAT_AWS':
         s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+        print(f"DEBUG (views.py): ENVIRONMENT is UAT_AWS. Using S3 bucket: {s3_bucket}")
         logger.info(f"Using S3 bucket: {s3_bucket}")
 
         # Use django-storages's own storage backend to check for file existence
         # This is more reliable as it uses the same logic that handled the upload.
         # The pdf_doc.file.name already contains the path relative to the bucket root (e.g., 'pdfs/filename.pdf')
+        print(f"DEBUG (views.py): Checking S3 existence for {pdf_doc.file.name} via storage backend.")
         storage_exists = await sync_to_async(pdf_doc.file.storage.exists)(pdf_doc.file.name)
         
         if not storage_exists:
+            print(f"ERROR (views.py): S3 upload failed: File {pdf_doc.file.name} not found by storage backend in bucket {s3_bucket}.")
             logger.error(f"S3 upload failed: File {pdf_doc.file.name} not found by storage backend in bucket {s3_bucket}.")
             await sync_to_async(pdf_doc.delete)() # Clean up DB entry
             return JsonResponse({'status': 'error', 'message': 'Failed to upload PDF to S3.'}, status=500)
+        print(f"DEBUG (views.py): S3 upload confirmed for {pdf_doc.file.name} using storage.exists().")
         logger.info(f"S3 upload confirmed for {pdf_doc.file.name} using storage.exists().")
+
+        # Wait for the S3 file to become available before proceeding with parsing
+        # Use the storage backend's exists method for consistency with upload
+        print(f"DEBUG (views.py): Waiting for S3 object '{pdf_doc.file.name}' to be available via storage backend.")
+        s3_available = await wait_for_s3_file(pdf_doc.file.storage, pdf_doc.file.name)
+        if not s3_available:
+            print(f"ERROR (views.py): S3 object '{pdf_doc.file.name}' did not become available for download.")
+            await sync_to_async(pdf_doc.delete)() # Clean up DB entry
+            return JsonResponse({'status': 'error', 'message': 'Failed to confirm PDF availability in S3.'}, status=500)
+        print(f"DEBUG (views.py): S3 object '{pdf_doc.file.name}' is now available.")
 
     try:
         start_total = time.time()
+        print(f"DEBUG (views.py): Starting PDF processing for PDF ID: {pdf_doc.id}")
 
         # 1. Fast PDF parsing (utils.parse_pdf_ultra_fast now handles S3 download internally)
+        print(f"DEBUG (views.py): Calling parse_pdf_ultra_fast for PDF ID: {pdf_doc.id}")
         pages_markdown = await parse_pdf_ultra_fast(pdf_doc)
         pdf_doc.num_pages = len(pages_markdown)
+        print(f"DEBUG (views.py): PDF parsed. Number of pages: {pdf_doc.num_pages}")
 
         # 2. Fast chunking with deduplication
+        print(f"DEBUG (views.py): Chunking documents for PDF ID: {pdf_doc.id}")
         docs = chunk_documents_ultra_fast(pages_markdown, pdf_doc.id, source=uploaded_file.name)
         pdf_doc.num_chunks = len(docs)
+        print(f"DEBUG (views.py): Documents chunked. Number of chunks: {pdf_doc.num_chunks}")
 
         # 3. Parallel indexing
         # Determine the base path for index files (local or S3 object key prefix)
         if settings.ENVIRONMENT == 'UAT_AWS':
             # For S3, paths are object keys, not file system paths
             index_base_path = f"faiss_indexes/{pdf_doc.id}"
+            print(f"DEBUG (views.py): Index base path (S3): {index_base_path}")
         else:
             # For local, use MEDIA_ROOT
             index_base_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id)).replace(" ", "_")
+            print(f"DEBUG (views.py): Index base path (Local): {index_base_path}")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             bm25_future = executor.submit(build_bm25_fast, docs)
@@ -296,7 +319,10 @@ async def summarize_chunk(request):
     chunk_page = request.POST.get('chunk_page')
     query = request.POST.get('query') # New: Get the original query
 
+    logger.info(f"summarize_chunk received: pdf_id={pdf_id}, chunk_page={chunk_page}, query={query}, chunk_content_len={len(chunk_content) if chunk_content else 0}")
+
     if not pdf_id or not chunk_content or not chunk_page or not query:
+        logger.error("Missing pdf_id, chunk_content, chunk_page, or query for summarize_chunk.")
         return JsonResponse({'status': 'error', 'message': 'Missing pdf_id, chunk_content, chunk_page, or query.'}, status=400)
 
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -307,9 +333,8 @@ async def summarize_chunk(request):
     logger.info(f"OpenAI API key loaded for summarization: {'sk-proj-...' + openai_api_key[-5:] if openai_api_key else 'None'}")
 
     try:
-        client = openai.AsyncOpenAI(api_key=openai_api_key)
-        
-        prompt = f"""Based EXCLUSIVELY on the following context, provide a concise and accurate summary of the text chunk in relation to the original question.
+        async with openai.AsyncOpenAI(api_key=openai_api_key) as client:
+            prompt = f"""Based EXCLUSIVELY on the following context, provide a concise and accurate summary of the text chunk in relation to the original question.
         
         Original Question: {query}
         
@@ -324,22 +349,32 @@ async def summarize_chunk(request):
         - Keep the summary to a maximum of 100 words.
         
         Summary:"""
-        logger.info(f"Summarization prompt for PDF ID {pdf_id}, Page {chunk_page}: {prompt[:500]}...") # Log first 500 chars of prompt
+            logger.info(f"Summarization prompt for PDF ID {pdf_id}, Page {chunk_page}: {prompt[:500]}...") # Log first 500 chars of prompt
 
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a precise assistant that summarizes text chunks based on a given question and context. Never hallucinate or use external knowledge."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_tokens=200,
-        )
-        summary = response.choices[0].message.content
-        return JsonResponse({'status': 'success', 'summary': summary})
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a precise assistant that summarizes text chunks based on a given question and context. Never hallucinate or use external knowledge."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=200,
+            )
+            summary = response.choices[0].message.content
+            logger.info(f"Successfully generated summary for PDF ID {pdf_id}, Page {chunk_page}. Summary: {summary[:200]}...") # Log first 200 chars of summary
+            return JsonResponse({'status': 'success', 'summary': summary})
 
+    except openai.APIStatusError as e:
+        logger.error(f"OpenAI API Status Error during chunk summarization (PDF ID {pdf_id}, Page {chunk_page}): Status {e.status_code}, Response: {e.response}", exc_info=True)
+        return JsonResponse({'status': 'error', 'message': f'OpenAI API error: {e.status_code} - {e.message}'}, status=500)
+    except openai.APIConnectionError as e:
+        logger.error(f"OpenAI API Connection Error during chunk summarization (PDF ID {pdf_id}, Page {chunk_page}): {e}", exc_info=True)
+        return JsonResponse({'status': 'error', 'message': f'OpenAI API connection error: {e}'}, status=500)
+    except openai.RateLimitError as e:
+        logger.error(f"OpenAI Rate Limit Error during chunk summarization (PDF ID {pdf_id}, Page {chunk_page}): {e}", exc_info=True)
+        return JsonResponse({'status': 'error', 'message': f'OpenAI rate limit exceeded: {e}'}, status=429)
     except Exception as e:
-        logger.error(f"OpenAI API error during chunk summarization: {e}", exc_info=True)
+        logger.error(f"Unexpected error during chunk summarization (PDF ID {pdf_id}, Page {chunk_page}): {e}", exc_info=True)
         return JsonResponse({'status': 'error', 'message': f'Error generating summary: {e}'}, status=500)
 
 
@@ -378,16 +413,20 @@ async def clear_data(request):
         if settings.ENVIRONMENT == 'UAT_AWS':
             s3_client = get_s3_client()
             s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+            print(f"DEBUG (views.py): ENVIRONMENT is UAT_AWS. Initializing S3 client for clearing data from bucket: {s3_bucket}")
 
         for pdf_doc in pdf_docs_to_delete:
+            print(f"DEBUG (views.py): Deleting data for PDF ID: {pdf_doc.id}")
             # Delete PDF file from storage (local or S3)
             if pdf_doc.file:
+                print(f"DEBUG (views.py): Deleting PDF file {pdf_doc.file.name} from storage.")
                 await sync_to_async(pdf_doc.file.delete)(save=False) # delete file from storage
 
             # Delete FAISS index and related files
             if settings.ENVIRONMENT == 'UAT_AWS' and s3_client:
                 # List and delete all objects under the PDF's FAISS index prefix
                 prefix = f"faiss_indexes/{pdf_doc.id}/"
+                print(f"DEBUG (views.py): Deleting S3 index objects under prefix: {prefix}")
                 try:
                     response = await sync_to_async(s3_client.list_objects_v2)(Bucket=s3_bucket, Prefix=prefix)
                     if 'Contents' in response:
@@ -397,17 +436,21 @@ async def clear_data(request):
                                 Bucket=s3_bucket,
                                 Delete={'Objects': objects_to_delete, 'Quiet': True}
                             )
+                            print(f"DEBUG (views.py): Deleted {len(objects_to_delete)} S3 objects for PDF ID {pdf_doc.id} under prefix {prefix}")
                             logger.info(f"Deleted S3 objects for PDF ID {pdf_doc.id} under prefix {prefix}")
                 except Exception as e:
+                    print(f"ERROR (views.py): Error deleting S3 objects for PDF ID {pdf_doc.id}: {e}")
                     logger.error(f"Error deleting S3 objects for PDF ID {pdf_doc.id}: {e}")
             else:
                 # Local deletion
                 index_dir_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id))
                 if os.path.isdir(index_dir_path):
                     import shutil
+                    print(f"DEBUG (views.py): Deleting local FAISS index directory: {index_dir_path}")
                     await sync_to_async(shutil.rmtree)(index_dir_path)
                     logger.info(f"Deleted local FAISS index directory: {index_dir_path}")
 
+        print(f"DEBUG (views.py): Deleting all PDFDocument and ChatHistory entries from database.")
         await sync_to_async(PDFDocument.objects.all().delete)()
         await sync_to_async(ChatHistory.objects.all().delete)()
 
@@ -415,13 +458,17 @@ async def clear_data(request):
         if settings.ENVIRONMENT != 'UAT_AWS':
             media_root = settings.MEDIA_ROOT
             if os.path.exists(media_root) and not os.listdir(media_root):
+                print(f"DEBUG (views.py): Deleting empty local media root: {media_root}")
                 await sync_to_async(os.rmdir)(media_root)
 
             faiss_indexes_root = os.path.join(media_root, 'faiss_indexes')
             if os.path.exists(faiss_indexes_root) and not os.listdir(faiss_indexes_root):
+                print(f"DEBUG (views.py): Deleting empty local FAISS indexes root: {faiss_indexes_root}")
                 await sync_to_async(os.rmdir)(faiss_indexes_root)
 
+        print(f"DEBUG (views.py): All data and cache cleared successfully.")
         return JsonResponse({'status': 'success', 'message': 'All data and cache cleared.'})
     except Exception as e:
+        print(f"ERROR (views.py): Error clearing data: {e}")
         logger.error(f"Error clearing data: {e}", exc_info=True)
         return JsonResponse({'status': 'error', 'message': f'Error clearing data: {e}'}, status=500)

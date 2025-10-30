@@ -292,7 +292,10 @@
                     chatStatus.innerHTML = ''; // Clear status
                     // Display AI's answer
 
-                    aiResponseDiv.innerHTML = `<p>${data.answer}</p>`;
+                    aiResponseDiv.innerHTML = `
+                        <div class="chat-message user-message"><strong>Question:</strong> ${query}</div>
+                        <div class="chat-message ai-message"><strong>Answer:</strong> ${data.answer}</div>
+                    `;
 
                     retrievedContextDiv.innerHTML = '';
                     data.context.forEach((ctx, index) => {
@@ -313,9 +316,9 @@
                                             style="padding: 8px 12px; font-size: 1.2em;"
                                             data-pdf-id="${currentPdfId}"
                                             data-chunk-content="${encodeURIComponent(ctx.content)}"
-                                            data-chunk-page="${ctx.page}"
+                                            data-chunk-page="${ctx.original_page}" {# Use original_page for summarization #}
                                             data-query="${encodeURIComponent(query)}">
-                                        👍
+                                      👍
                                     </button>
                                 </div>
                             </div>
