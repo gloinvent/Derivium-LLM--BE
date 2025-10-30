@@ -91,125 +91,69 @@ def s3_upload_file(file_content: bytes, bucket: str, object_name: str):
 
 def s3_download_file(bucket: str, object_name: str) -> bytes | None:
     """
-    Downloads a file from an S3 bucket.
-    Tries several candidate keys to handle cases where Django storage uses a 'media/' prefix
-    or an AWS_LOCATION prefix.
+    Downloads a file from an S3 bucket using the provided object_name directly.
+    Assumes object_name is the correct, fully qualified S3 key.
     """
     s3_client = get_s3_client()
+    key = object_name.replace(os.sep, "/") # Ensure forward slashes for S3 keys
 
-    # Build candidate keys to try (in order):
-    candidates = []
-    normalized = object_name.replace(os.sep, "/")
-    candidates.append(normalized)  # the original key
-
-    # If the key doesn't start with media/, try with media/ prefix
-    if not normalized.startswith("media/"):
-        candidates.append(f"media/{normalized}")
-
-    # Try AWS_LOCATION if set (e.g., settings.AWS_LOCATION == "media" or "uploads")
-    aws_loc = getattr(settings, "AWS_LOCATION", None)
-    if aws_loc:
-        aws_loc_norm = aws_loc.rstrip("/").lstrip("/")
-        # if not already prefixed with aws_loc, add candidate
-        if not normalized.startswith(f"{aws_loc_norm}/"):
-            candidates.append(f"{aws_loc_norm}/{normalized}")
-
-    # Also if normalized starts with media/, add a stripped candidate (reverse)
-    if normalized.startswith("media/"):
-        candidates.append(normalized[len("media/"):])
-
-    # Remove duplicates while keeping order
-    seen = set()
-    final_candidates = []
-    for c in candidates:
-        if c not in seen:
-            final_candidates.append(c)
-            seen.add(c)
-
-    last_exception = None
-    for key in final_candidates:
-        try:
-            print(f"DEBUG (utils.py - s3_download_file): Attempting to download '{key}' from s3://{bucket}")
-            logger.info(f"Attempting to download '{key}' from s3://{bucket}")
-            response = s3_client.get_object(Bucket=bucket, Key=key)
-            data = response["Body"].read()
-            print(f"DEBUG (utils.py - s3_download_file): Successfully downloaded '{key}' from s3://{bucket}")
-            logger.info(f"Successfully downloaded '{key}' from s3://{bucket}")
-            return data
-        except ClientError as e:
-            last_exception = e
-            code = e.response.get("Error", {}).get("Code", "")
-            # Common "not found" codes: NoSuchKey, 404, NotFound
-            if code in ("NoSuchKey", "404", "NotFound"):
-                print(f"WARNING (utils.py - s3_download_file): Object '{key}' not found in s3://{bucket} (code={code}). Trying next candidate if any.")
-                logger.warning(f"Object '{key}' not found in s3://{bucket} (code={code}).")
-                continue
-            # Access denied (403) — bail out (credentials/permissions)
-            if code in ("403", "AccessDenied"):
-                print(f"ERROR (utils.py - s3_download_file): Access denied when attempting to get '{key}' from s3://{bucket}: {e}")
-                logger.error(f"Access denied when attempting to get '{key}' from s3://{bucket}: {e}")
-                return None
-            # Other errors — log and continue trying other candidates
+    try:
+        print(f"DEBUG (utils.py - s3_download_file): Attempting to download '{key}' from s3://{bucket}")
+        logger.info(f"Attempting to download '{key}' from s3://{bucket}")
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        data = response["Body"].read()
+        print(f"DEBUG (utils.py - s3_download_file): Successfully downloaded '{key}' from s3://{bucket}")
+        logger.info(f"Successfully downloaded '{key}' from s3://{bucket}")
+        return data
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            print(f"ERROR (utils.py - s3_download_file): Object '{key}' not found in s3://{bucket} (code={code}).")
+            logger.error(f"Object '{key}' not found in s3://{bucket} (code={code}).")
+        elif code in ("403", "AccessDenied"):
+            print(f"ERROR (utils.py - s3_download_file): Access denied when attempting to get '{key}' from s3://{bucket}: {e}")
+            logger.error(f"Access denied when attempting to get '{key}' from s3://{bucket}: {e}")
+        else:
             print(f"ERROR (utils.py - s3_download_file): Error downloading '{key}' from s3://{bucket}: {e}")
             logger.error(f"Error downloading '{key}' from s3://{bucket}: {e}")
-            continue
-
-    # If we get here, all candidates failed
-    if last_exception is not None:
-        # If final failure was 'not found', warn; else log exception
-        code = last_exception.response.get("Error", {}).get("Code", "")
-        print(f"WARNING (utils.py - s3_download_file): All candidate keys tried but not found in s3://{bucket}. last error code={code}")
-        logger.warning(f"All candidate keys tried but not found in s3://{bucket}. last error code={code}")
-    else:
-        print(f"ERROR (utils.py - s3_download_file): Unknown error while trying to download {object_name} from s3://{bucket}")
-        logger.error(f"Unknown error while trying to download {object_name} from s3://{bucket}")
-
-    return None
+        return None
+    except Exception as e:
+        print(f"ERROR (utils.py - s3_download_file): Unexpected error downloading '{key}' from s3://{bucket}: {e}")
+        logger.error(f"Unexpected error downloading '{key}' from s3://{bucket}: {e}")
+        return None
 
 
 def s3_file_exists(bucket: str, object_name: str) -> bool:
     """
-    Checks if a file exists in an S3 bucket.
-    Will also attempt alternate keys similar to s3_download_file to be robust.
+    Checks if a file exists in an S3 bucket using the provided object_name directly.
+    Assumes object_name is the correct, fully qualified S3 key.
     """
     s3_client = get_s3_client()
-    normalized = object_name.replace(os.sep, "/")
-    candidates = [normalized]
+    key = object_name.replace(os.sep, "/") # Ensure forward slashes for S3 keys
 
-    if not normalized.startswith("media/"):
-        candidates.append(f"media/{normalized}")
-
-    aws_loc = getattr(settings, "AWS_LOCATION", None)
-    if aws_loc:
-        aws_loc_norm = aws_loc.rstrip("/").lstrip("/")
-        if not normalized.startswith(f"{aws_loc_norm}/"):
-            candidates.append(f"{aws_loc_norm}/{normalized}")
-
-    # Try each candidate
-    for key in candidates:
-        try:
-            print(f"DEBUG (utils.py - s3_file_exists): Checking existence of {key} in s3://{bucket}")
-            logger.info(f"Checking existence of {key} in s3://{bucket}")
-            s3_client.head_object(Bucket=bucket, Key=key)
-            print(f"DEBUG (utils.py - s3_file_exists): Object {key} found in s3://{bucket}")
-            logger.info(f"Object {key} found in s3://{bucket}")
-            return True
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "")
-            if code in ("404", "NoSuchKey", "NotFound"):
-                print(f"DEBUG (utils.py - s3_file_exists): Object {key} not found (code={code}).")
-                logger.debug(f"Object {key} not found (code={code}).")
-                continue
-            if code in ("403", "AccessDenied"):
-                print(f"ERROR (utils.py - s3_file_exists): Access denied when checking {key} in s3://{bucket}: {e}")
-                logger.error(f"Access denied when checking {key} in s3://{bucket}: {e}")
-                return False
+    try:
+        print(f"DEBUG (utils.py - s3_file_exists): Checking existence of {key} in s3://{bucket}")
+        logger.info(f"Checking existence of {key} in s3://{bucket}")
+        s3_client.head_object(Bucket=bucket, Key=key)
+        print(f"DEBUG (utils.py - s3_file_exists): Object {key} found in s3://{bucket}")
+        logger.info(f"Object {key} found in s3://{bucket}")
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            print(f"DEBUG (utils.py - s3_file_exists): Object {key} not found (code={code}).")
+            logger.debug(f"Object {key} not found (code={code}).")
+        elif code in ("403", "AccessDenied"):
+            print(f"ERROR (utils.py - s3_file_exists): Access denied when checking {key} in s3://{bucket}: {e}")
+            logger.error(f"Access denied when checking {key} in s3://{bucket}: {e}")
+        else:
             print(f"ERROR (utils.py - s3_file_exists): Error checking existence of {key} in s3://{bucket}: {e}")
             logger.error(f"Error checking existence of {key} in s3://{bucket}: {e}")
-            return False
-
-    # none found
-    return False
+        return False
+    except Exception as e:
+        print(f"ERROR (utils.py - s3_file_exists): Unexpected error checking existence of {key} in s3://{bucket}: {e}")
+        logger.error(f"Unexpected error checking existence of {key} in s3://{bucket}: {e}")
+        return False
 
 
 def get_faiss_index_s3_path(pdf_id: int, filename: str) -> str:
@@ -221,22 +165,27 @@ def get_faiss_index_s3_path(pdf_id: int, filename: str) -> str:
 def get_pdf_s3_path(pdf_filename_in_db: str) -> str:
     """
     Generates correct S3 path for the PDF file.
-    In AWS (UAT_AWS/PROD_AWS), we KEEP the 'media/' prefix because S3 object keys include it.
-    In local environments, we may strip it.
+    In AWS (UAT_AWS/PROD_AWS), we PREPEND the 'AWS_LOCATION' prefix to form the full S3 object key.
+    In local environments, we ensure no 'media/' prefix is present if it was added by mistake.
     """
     s3_path = pdf_filename_in_db.replace(os.sep, "/")
 
-    # Preserve 'media/' prefix for AWS deployments
-    environment = os.getenv("ENVIRONMENT", "").upper()
-    if environment in ["UAT_AWS", "PROD_AWS"]:
-        print(f"DEBUG (utils.py - get_pdf_s3_path): Preserving 'media/' prefix for {environment} environment.")
-    else:
-        # Strip only for local/dev environment
+    # Prepend AWS_LOCATION for AWS deployments to form the full S3 object key
+    if settings.ENVIRONMENT in ["UAT_AWS", "PROD_AWS"]:
+        aws_location = getattr(settings, "AWS_LOCATION", "").strip('/')
+        if aws_location and not s3_path.startswith(f"{aws_location}/"):
+            s3_path = f"{aws_location}/{s3_path}"
+            print(f"DEBUG (utils.py - get_pdf_s3_path): Prepended '{aws_location}/' for {settings.ENVIRONMENT} environment. Final S3 path: {s3_path}")
+        else:
+            print(f"DEBUG (utils.py - get_pdf_s3_path): Using existing S3 path for {settings.ENVIRONMENT} environment: {s3_path}")
+    else: # UAT_LOCAL or other local environments
+        # Strip 'media/' prefix if it exists, as local storage doesn't use it in the path
         if s3_path.startswith("media/"):
             s3_path = s3_path[len("media/"):]
-            print("DEBUG (utils.py - get_pdf_s3_path): Stripped 'media/' prefix for local environment.")
+            print(f"DEBUG (utils.py - get_pdf_s3_path): Stripped 'media/' prefix for local environment. Final S3 path: {s3_path}")
+        else:
+            print(f"DEBUG (utils.py - get_pdf_s3_path): Using local path. Final S3 path: {s3_path}")
     
-    print(f"DEBUG (utils.py - get_pdf_s3_path): Final S3 path for PDF: {s3_path}")
     return s3_path
 
 
@@ -388,17 +337,31 @@ async def parse_pdf_ultra_fast(pdf_document_instance) -> List[Tuple[int, str]]:
     temp_file_path = None
 
     if settings.ENVIRONMENT == 'UAT_AWS':
-        # Use the utility function to get the correct S3 object key
-        s3_object_name = get_pdf_s3_path(pdf_document_instance.file.name)
-        print(f"DEBUG (utils.py - parse_pdf_ultra_fast): ENVIRONMENT is UAT_AWS. Attempting to download S3 object: {s3_object_name}")
-        logger.info(f"Attempting to download S3 object: {s3_object_name}")
-        temp_file_path = download_pdf_from_s3_to_temp(s3_object_name)
-        if not temp_file_path:
-            print(f"ERROR (utils.py - parse_pdf_ultra_fast): Failed to download PDF from S3: {s3_object_name}")
-            logger.error(f"Failed to download PDF from S3: {s3_object_name}")
+        # Directly use Django's storage backend to read the file content
+        # This leverages S3Boto3Storage's internal handling of AWS_LOCATION
+        print(f"DEBUG (utils.py - parse_pdf_ultra_fast): ENVIRONMENT is UAT_AWS. Attempting to read PDF content via Django storage for: {pdf_document_instance.file.name}")
+        logger.info(f"Attempting to read PDF content via Django storage for: {pdf_document_instance.file.name}")
+        
+        try:
+            pdf_data = await asyncio.to_thread(pdf_document_instance.file.read)
+            if not pdf_data:
+                print(f"ERROR (utils.py - parse_pdf_ultra_fast): PDF data is empty after reading from storage for: {pdf_document_instance.file.name}")
+                logger.error(f"PDF data is empty after reading from storage for: {pdf_document_instance.file.name}")
+                return []
+
+            # Write the content to a temporary file for PyMuPDF to process
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            temp_file.write(pdf_data)
+            temp_file.close()
+            temp_file_path = temp_file.name
+            file_path = temp_file_path
+            print(f"DEBUG (utils.py - parse_pdf_ultra_fast): PDF content read from storage and saved to temporary file: {file_path}")
+            logger.info(f"PDF content read from storage and saved to temporary file: {file_path}")
+
+        except Exception as e:
+            print(f"ERROR (utils.py - parse_pdf_ultra_fast): Failed to read PDF from Django storage for {pdf_document_instance.file.name}: {e}")
+            logger.error(f"Failed to read PDF from Django storage for {pdf_document_instance.file.name}: {e}", exc_info=True)
             return []
-        file_path = temp_file_path
-        print(f"DEBUG (utils.py - parse_pdf_ultra_fast): PDF downloaded to temporary file: {file_path}")
     else:
         file_path = pdf_document_instance.file.path # Local file path
         print(f"DEBUG (utils.py - parse_pdf_ultra_fast): Using local PDF file: {file_path}")
