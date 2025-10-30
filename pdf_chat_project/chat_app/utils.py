@@ -89,7 +89,7 @@ def s3_upload_file(file_content: bytes, bucket: str, object_name: str):
         logger.error(f"Error uploading {object_name} to s3://{bucket}: {e}")
         return False
 
-def s3_download_file(bucket: str, object_name: str) -> bytes | None:
+def s3_download_file(bucket: str, object_name: str):
     """
     Downloads a file from an S3 bucket using the provided object_name directly.
     Assumes object_name is the correct, fully qualified S3 key.
