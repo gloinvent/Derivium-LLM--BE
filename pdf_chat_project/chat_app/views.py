@@ -406,13 +406,16 @@ async def clear_data(request):
     try:
         # Clear in-memory store
         processed_data_store.clear()
+        print("data cleared----------------------")
 
         # Delete all PDF documents and their associated files/indexes
         pdf_docs_to_delete = await sync_to_async(list)(PDFDocument.objects.all())
+        print("pdf doc deleted-----------------------")
         s3_client = None
         if settings.ENVIRONMENT == 'UAT_AWS':
             s3_client = get_s3_client()
             s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+            print("s3 bucket-----------------------")
             print(f"DEBUG (views.py): ENVIRONMENT is UAT_AWS. Initializing S3 client for clearing data from bucket: {s3_bucket}")
 
         for pdf_doc in pdf_docs_to_delete:
