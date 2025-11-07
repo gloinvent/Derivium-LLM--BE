@@ -454,8 +454,8 @@ async def clear_data(request):
                     logger.info(f"Deleted local FAISS index directory: {index_dir_path}")
 
         print(f"DEBUG (views.py): Deleting all PDFDocument and ChatHistory entries from database.")
-        await sync_to_async(PDFDocument.objects.all().delete)()
-        await sync_to_async(ChatHistory.objects.all().delete)()
+        await sync_to_async(lambda: PDFDocument.objects.all().delete())()
+        await sync_to_async(lambda: ChatHistory.objects.all().delete())()
 
         # Clear local media root directories if empty (only relevant for UAT_LOCAL)
         if settings.ENVIRONMENT != 'UAT_AWS':
