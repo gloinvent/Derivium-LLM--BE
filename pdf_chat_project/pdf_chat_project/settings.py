@@ -86,8 +86,12 @@ WSGI_APPLICATION = 'pdf_chat_project.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': env_vars.get('DB_ENGINE', 'django.db.backends.postgresql'),
+        'NAME': env_vars.get('DB_NAME', ''),
+        'USER': env_vars.get('DB_USER', ''),
+        'PASSWORD': env_vars.get('DB_PASSWORD', ''),
+        'HOST': env_vars.get('DB_HOST', ''),
+        'PORT': env_vars.get('DB_PORT', '5432'),
     }
 }
 
