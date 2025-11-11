@@ -326,30 +326,24 @@ def process_page_batch(args: Tuple[str, List[int]]) -> List[Tuple[int, str]]:
 
     return results
 
-async def parse_pdf_ultra_fast(pdf_document_instance) -> List[Tuple[int, str]]:
+def parse_pdf_ultra_fast(pdf_document_instance) -> List[Tuple[int, str]]:
     """
     Ultra-fast PDF parsing with optimal parallelization,
     handling both local and S3 PDF files.
     """
     start_time = time.time()
-    
     file_path = None
     temp_file_path = None
 
     if settings.ENVIRONMENT == 'UAT_AWS':
-        # Directly use Django's storage backend to read the file content
-        # This leverages S3Boto3Storage's internal handling of AWS_LOCATION
         print(f"DEBUG (utils.py - parse_pdf_ultra_fast): ENVIRONMENT is UAT_AWS. Attempting to read PDF content via Django storage for: {pdf_document_instance.file.name}")
         logger.info(f"Attempting to read PDF content via Django storage for: {pdf_document_instance.file.name}")
-        
         try:
-            pdf_data = await asyncio.to_thread(pdf_document_instance.file.read)
+            pdf_data = pdf_document_instance.file.read()
             if not pdf_data:
                 print(f"ERROR (utils.py - parse_pdf_ultra_fast): PDF data is empty after reading from storage for: {pdf_document_instance.file.name}")
                 logger.error(f"PDF data is empty after reading from storage for: {pdf_document_instance.file.name}")
                 return []
-
-            # Write the content to a temporary file for PyMuPDF to process
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
             temp_file.write(pdf_data)
             temp_file.close()
@@ -357,7 +351,6 @@ async def parse_pdf_ultra_fast(pdf_document_instance) -> List[Tuple[int, str]]:
             file_path = temp_file_path
             print(f"DEBUG (utils.py - parse_pdf_ultra_fast): PDF content read from storage and saved to temporary file: {file_path}")
             logger.info(f"PDF content read from storage and saved to temporary file: {file_path}")
-
         except Exception as e:
             print(f"ERROR (utils.py - parse_pdf_ultra_fast): Failed to read PDF from Django storage for {pdf_document_instance.file.name}: {e}")
             logger.error(f"Failed to read PDF from Django storage for {pdf_document_instance.file.name}: {e}", exc_info=True)
@@ -374,37 +367,20 @@ async def parse_pdf_ultra_fast(pdf_document_instance) -> List[Tuple[int, str]]:
     try:
         with fitz.open(file_path) as doc:
             total_pages = doc.page_count
-
-            # Create page batches for parallel processing
             page_batches = []
             batch_size = max(1, total_pages // MAX_WORKERS)
-
             for i in range(0, total_pages, batch_size):
                 page_batches.append((file_path, list(range(i, min(i + batch_size, total_pages)))))
-
-            # Process batches in parallel
+            results = []
             with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                loop = asyncio.get_event_loop()
-                tasks = [
-                    loop.run_in_executor(executor, process_page_batch, batch)
-                    for batch in page_batches
-                ]
-                batch_results = await asyncio.gather(*tasks)
-
-            # Flatten results
-            all_results = []
+                batch_results = list(executor.map(process_page_batch, page_batches))
             for batch in batch_results:
-                all_results.extend(batch)
-
-            # Sort by page number
-            all_results.sort(key=lambda x: x[0])
-
+                results.extend(batch)
+            results.sort(key=lambda x: x[0])
             parsing_time = time.time() - start_time
             logger.info(f"PDF parsed {total_pages} pages in {parsing_time:.2f}s")
-
-            return all_results
+            return results
     finally:
-        # Clean up temporary file if it was downloaded from S3
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
             logger.info(f"Cleaned up temporary PDF file: {temp_file_path}")
@@ -842,57 +818,31 @@ def cross_encoder_reranking(query: str, candidates: List[Document]) -> List[Docu
 # LLM Answer Generation
 # -------------------------
 
-async def answer_with_context_optimized(query: str, candidates: List[Document]) -> Tuple[str, List[Dict[str, Any]]]:
+def answer_with_context_optimized(query: str, candidates: List[Document]) -> Tuple[str, List[Dict[str, Any]]]:
     """Optimized answer generation with better context assembly, handling expanded page context."""
     context_parts = []
-    
-    # Group candidates by page number for better context presentation
     pages_to_chunks: Dict[int, List[Document]] = {}
     for doc in candidates:
         page_num = doc.metadata.get('page')
         if page_num not in pages_to_chunks:
             pages_to_chunks[page_num] = []
         pages_to_chunks[page_num].append(doc)
-
-    # Sort pages and then chunks within each page
     sorted_page_nums = sorted(pages_to_chunks.keys())
-
     for page_num in sorted_page_nums:
         chunks_on_page = sorted(pages_to_chunks[page_num], key=lambda x: x.metadata.get('chunk', 0))
-        
         source_info = chunks_on_page[0].metadata.get('source', 'Unknown')
-        
-        # Combine all chunk content for the current page
         page_content = "\n".join([doc.page_content for doc in chunks_on_page])
-        
         context_parts.append(
             f"[Source: {source_info}, Page: {page_num}]:\n{page_content}"
         )
-
     assembled_context = "\n\n".join(context_parts)
-
-    prompt = f"""Based EXCLUSIVELY on the following context, provide a concise and accurate answer to the question.
-
-Question: {query}
-
-Context Information:
-{assembled_context}
-
-Instructions:
-- Answer using ONLY information from the provided context
-- If the context doesn't contain relevant information, state "I cannot find this information in the document"
-- Be precise and cite the source pages when possible and give page numbers correctly if multiple pages are referenced
-- Keep the answer focused and avoid speculation
-
-Answer:"""
-
+    prompt = f"""Based EXCLUSIVELY on the following context, provide a concise and accurate answer to the question.\n\nQuestion: {query}\n\nContext Information:\n{assembled_context}\n\nInstructions:\n- Answer using ONLY information from the provided context\n- If the context doesn't contain relevant information, state \"I cannot find this information in the document\"\n- Be precise and cite the source pages when possible and give page numbers correctly if multiple pages are referenced\n- Keep the answer focused and avoid speculation\n\nAnswer:"""
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         return "❌ OpenAI API key not configured.", []
-
     try:
-        client = openai.AsyncOpenAI(api_key=openai_api_key, max_retries=0)
-        response = await client.chat.completions.create(
+        client = openai.OpenAI(api_key=openai_api_key)
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a precise assistant that answers questions based strictly on provided context. Never hallucinate or use external knowledge."},
@@ -901,15 +851,12 @@ Answer:"""
             temperature=0.1,
             max_tokens=800,
         )
-        
-        # Prepare chunks for return
         chunk_data = []
         for doc in candidates:
             chunk_data.append({
                 "page_content": doc.page_content,
                 "metadata": doc.metadata
             })
-            
         return response.choices[0].message.content, chunk_data
     except Exception as e:
         logger.error(f"OpenAI API error: {e}")

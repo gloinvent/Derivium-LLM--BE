@@ -26,4 +26,5 @@ Pillow>=10.0.0
 opencv-python-headless>=4.8.1
 django-storages
 boto3
+sentence-transformers
 psycopg2
