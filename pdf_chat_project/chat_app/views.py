@@ -49,6 +49,9 @@ def index(request):
 async def process_pdf_in_background(pdf_doc_id):
     """Background processing function for PDF."""
     try:
+        # Set tokenizers parallelism to avoid warnings
+        os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+        
         # Get PDF document
         pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_doc_id)
         
@@ -89,6 +92,7 @@ async def process_pdf_in_background(pdf_doc_id):
         pdf_doc.num_pages = len(pages_markdown)
         pdf_doc.progress_percentage = 30
         await sync_to_async(pdf_doc.save)()
+        logger.info(f"PDF parsing completed for {pdf_doc.filename}. Pages: {pdf_doc.num_pages}")
         
         if not pages_markdown:
             pdf_doc.processing_status = 'failed'
@@ -104,6 +108,7 @@ async def process_pdf_in_background(pdf_doc_id):
         pdf_doc.num_chunks = len(docs)
         pdf_doc.progress_percentage = 50
         await sync_to_async(pdf_doc.save)()
+        logger.info(f"Document chunking completed for {pdf_doc.filename}. Chunks: {pdf_doc.num_chunks}")
         
         # Step 3: Build vector store (80% progress)
         logger.info(f"Building vector store for: {pdf_doc.filename}")
@@ -122,10 +127,12 @@ async def process_pdf_in_background(pdf_doc_id):
             return build_bm25_fast(docs)
         
         # Run both operations concurrently
+        logger.info(f"Starting parallel vector store and BM25 building for PDF {pdf_doc.id}")
         vectorstore_task = asyncio.get_event_loop().run_in_executor(executor, build_vectorstore)
         bm25_task = asyncio.get_event_loop().run_in_executor(executor, build_bm25)
         
         vectorstore, (bm25_obj, tokenized_texts) = await asyncio.gather(vectorstore_task, bm25_task)
+        logger.info(f"Vector store and BM25 building completed for PDF {pdf_doc.id}")
         
         pdf_doc.progress_percentage = 80
         await sync_to_async(pdf_doc.save)()
@@ -149,14 +156,16 @@ async def process_pdf_in_background(pdf_doc_id):
         bm25_path, tokenized_path, docs_path = await asyncio.get_event_loop().run_in_executor(
             executor, save_all_data
         )
+        logger.info(f"Data saving completed for PDF {pdf_doc.id}")
         
-        # Store processed data in memory for immediate use
+        # Store processed data in memory for immediate use - IMPORTANT: Use correct key
         processed_data_store[pdf_doc.id] = {
             "docs": docs,
             "vectorstore": vectorstore,
             "bm25_obj": bm25_obj,
             "tokenized_texts": tokenized_texts,
         }
+        logger.info(f"Stored data in memory for PDF {pdf_doc.id}. Memory store now has keys: {list(processed_data_store.keys())}")
         
         # Final update
         processing_time = time.time() - start_time
@@ -241,48 +250,74 @@ def chat(request):
             return JsonResponse({'status': 'error', 'message': 'Missing pdf_id or query.'}, status=400)
 
         try:
+            # Convert pdf_id to int if it's a string
+            try:
+                pdf_id = int(pdf_id)
+            except (ValueError, TypeError):
+                return JsonResponse({'status': 'error', 'message': 'Invalid pdf_id format.'}, status=400)
+
             pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_id)
-            if not pdf_doc.processed:
-                return JsonResponse({'status': 'error', 'message': 'PDF not yet processed.'}, status=400)
+            
+            # More detailed status checking
+            logger.info(f"Chat request for PDF {pdf_id}: processed={pdf_doc.processed}, processing_status={pdf_doc.processing_status}, progress={getattr(pdf_doc, 'progress_percentage', 0)}%, has_memory_data={pdf_id in processed_data_store}")
+            
+            # Check processing status more flexibly
+            is_processing_complete = (
+                pdf_doc.processed or 
+                pdf_doc.processing_status == 'completed' or
+                (pdf_doc.processing_status == 'processing' and pdf_doc.progress_percentage == 100)
+            )
+            
+            # If not processed but has data in memory, allow chat
+            if not is_processing_complete and pdf_id not in processed_data_store:
+                logger.warning(f"PDF {pdf_id} not ready for chat. Status: {pdf_doc.processing_status}, Progress: {getattr(pdf_doc, 'progress_percentage', 0)}%")
+                return JsonResponse({
+                    'status': 'error', 
+                    'message': f'PDF not yet processed. Current status: {pdf_doc.processing_status}',
+                    'processing_status': pdf_doc.processing_status,
+                    'progress': getattr(pdf_doc, 'progress_percentage', 0)
+                }, status=400)
 
             # Retrieve processed data from store or load from disk
             data = processed_data_store.get(pdf_id)
             if not data:
-                if pdf_doc.bm25_path and pdf_doc.tokenized_texts_path and pdf_doc.docs_path:
-                    try:
-                        # Pass pdf_id to loading functions
-                        # For FAISS, the path is the directory containing index.faiss and index.pkl
-                        # For S3, load_faiss_vector_store uses pdf_id to construct S3 paths
-                        # For FAISS, the path is the directory containing index.faiss and index.pkl for local storage.
-                        # For S3, load_faiss_vector_store uses pdf_id to construct S3 paths internally, so index_path can be an empty string.
-                        vectorstore = await sync_to_async(load_faiss_vector_store)(
-                            pdf_doc.id,
-                            os.path.dirname(pdf_doc.bm25_path) if settings.ENVIRONMENT != 'UAT_AWS' else ""
-                        )
-                        bm25_obj = await sync_to_async(load_bm25_object)(pdf_doc.id, pdf_doc.bm25_path)
-                        tokenized_texts = await sync_to_async(load_tokenized_texts)(pdf_doc.id, pdf_doc.tokenized_texts_path)
-                        docs = await sync_to_async(load_docs)(pdf_doc.id, pdf_doc.docs_path)
+                logger.info(f"Loading processed data from storage for PDF {pdf_id}")
+                
+                # Check if we have the required paths
+                if not all([pdf_doc.bm25_path, pdf_doc.tokenized_texts_path, pdf_doc.docs_path]):
+                    return JsonResponse({'status': 'error', 'message': 'Processed data paths not found. Please reprocess the PDF.'}, status=404)
+                
+                try:
+                    # Load all components
+                    vectorstore = await sync_to_async(load_faiss_vector_store)(
+                        pdf_doc.id,
+                        os.path.dirname(pdf_doc.bm25_path) if settings.ENVIRONMENT != 'UAT_AWS' else ""
+                    )
+                    bm25_obj = await sync_to_async(load_bm25_object)(pdf_doc.id, pdf_doc.bm25_path)
+                    tokenized_texts = await sync_to_async(load_tokenized_texts)(pdf_doc.id, pdf_doc.tokenized_texts_path)
+                    docs = await sync_to_async(load_docs)(pdf_doc.id, pdf_doc.docs_path)
 
-                        if vectorstore is None or bm25_obj is None or not tokenized_texts or not docs:
-                            raise ValueError("Failed to load all processed data components.")
+                    if vectorstore is None or bm25_obj is None or not tokenized_texts or not docs:
+                        raise ValueError("Failed to load all processed data components.")
 
-                        # Store in memory for subsequent requests
-                        processed_data_store[pdf_doc.id] = {
-                            "docs": docs,
-                            "vectorstore": vectorstore,
-                            "bm25_obj": bm25_obj,
-                            "tokenized_texts": tokenized_texts,
-                        }
-                    except Exception as e:
-                        logger.error(f"Error loading processed data from disk/S3 for PDF {pdf_id}: {e}", exc_info=True)
-                        return JsonResponse({'status': 'error', 'message': f'Error loading processed data: {e}'}, status=500)
-                else:
-                    return JsonResponse({'status': 'error', 'message': 'Processed data paths not found in PDFDocument.'}, status=404)
+                    # Store in memory for subsequent requests
+                    processed_data_store[pdf_id] = {
+                        "docs": docs,
+                        "vectorstore": vectorstore,
+                        "bm25_obj": bm25_obj,
+                        "tokenized_texts": tokenized_texts,
+                    }
+                    logger.info(f"Successfully loaded processed data for PDF {pdf_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Error loading processed data from disk/S3 for PDF {pdf_id}: {e}", exc_info=True)
+                    return JsonResponse({'status': 'error', 'message': f'Error loading processed data: {e}. Please reprocess the PDF.'}, status=500)
 
-            docs = processed_data_store[pdf_doc.id]["docs"]
-            vectorstore = processed_data_store[pdf_doc.id]["vectorstore"]
-            bm25_obj = processed_data_store[pdf_doc.id]["bm25_obj"]
-            tokenized_texts = processed_data_store[pdf_doc.id]["tokenized_texts"]
+            # Get the processed data
+            docs = processed_data_store[pdf_id]["docs"]
+            vectorstore = processed_data_store[pdf_id]["vectorstore"]
+            bm25_obj = processed_data_store[pdf_id]["bm25_obj"]
+            tokenized_texts = processed_data_store[pdf_id]["tokenized_texts"]
 
             start_retrieval = time.time()
             candidates = hybrid_retrieval_optimized(
@@ -420,14 +455,25 @@ def check_processing_status(request, pdf_id):
     async def _check_processing_status():
         try:
             pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_id)
+            
+            # Check if data exists in memory
+            has_memory_data = pdf_id in processed_data_store
+            memory_data_keys = list(processed_data_store.get(pdf_id, {}).keys()) if has_memory_data else []
+            
             return JsonResponse({
                 'status': pdf_doc.processing_status,
-                'progress': pdf_doc.progress_percentage,
+                'progress': getattr(pdf_doc, 'progress_percentage', 0),
                 'processed': pdf_doc.processed,
-                'error': pdf_doc.error_message,
-                'num_pages': getattr(pdf_doc, 'num_pages', 0),
-                'num_chunks': getattr(pdf_doc, 'num_chunks', 0),
-                'filename': pdf_doc.filename
+                'error': getattr(pdf_doc, 'error_message', None),
+                'num_pages': getattr(pdf_doc, 'num_pages', None),
+                'num_chunks': getattr(pdf_doc, 'num_chunks', None),
+                'filename': pdf_doc.filename,
+                'has_memory_data': has_memory_data,
+                'memory_data_keys': memory_data_keys,
+                'processing_time': getattr(pdf_doc, 'processing_time', None),
+                'bm25_path': getattr(pdf_doc, 'bm25_path', None),
+                'tokenized_texts_path': getattr(pdf_doc, 'tokenized_texts_path', None),
+                'docs_path': getattr(pdf_doc, 'docs_path', None),
             })
         except PDFDocument.DoesNotExist:
             return JsonResponse({'status': 'error', 'message': 'PDF not found'}, status=404)
@@ -536,3 +582,99 @@ def clear_data(request):
             return JsonResponse({'status': 'error', 'message': f'Error clearing data: {e}'}, status=500)
     
     return async_to_sync(_clear_data)()
+
+@require_GET
+def debug_pdf_status(request, pdf_id):
+    """Debug endpoint to check PDF status and data availability."""
+    async def _debug_pdf_status():
+        try:
+            pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_id)
+            
+            # Check memory store
+            has_memory_data = int(pdf_id) in processed_data_store
+            memory_data_keys = list(processed_data_store.get(int(pdf_id), {}).keys()) if has_memory_data else []
+            
+            return JsonResponse({
+                'pdf_id': pdf_id,
+                'filename': pdf_doc.filename,
+                'processed': pdf_doc.processed,
+                'processing_status': pdf_doc.processing_status,
+                'progress_percentage': getattr(pdf_doc, 'progress_percentage', 0),
+                'error_message': getattr(pdf_doc, 'error_message', None),
+                'bm25_path': getattr(pdf_doc, 'bm25_path', None),
+                'tokenized_texts_path': getattr(pdf_doc, 'tokenized_texts_path', None),
+                'docs_path': getattr(pdf_doc, 'docs_path', None),
+                'has_memory_data': has_memory_data,
+                'memory_data_keys': memory_data_keys,
+                'num_pages': getattr(pdf_doc, 'num_pages', 0),
+                'num_chunks': getattr(pdf_doc, 'num_chunks', 0),
+            })
+        except PDFDocument.DoesNotExist:
+            return JsonResponse({'error': 'PDF not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Debug error: {e}")
+            return JsonResponse({'error': str(e)}, status=500)
+    
+    return async_to_sync(_debug_pdf_status)()
+
+@require_GET
+def list_pdfs(request):
+    """List all PDFs with their status for debugging."""
+    try:
+        pdfs = PDFDocument.objects.all().order_by('-id')
+        pdf_list = []
+        
+        for pdf in pdfs:
+            pdf_list.append({
+                'id': pdf.id,
+                'filename': pdf.filename,
+                'processed': pdf.processed,
+                'processing_status': getattr(pdf, 'processing_status', 'unknown'),
+                'progress_percentage': getattr(pdf, 'progress_percentage', 0),
+                'has_memory_data': pdf.id in processed_data_store,
+                'num_pages': getattr(pdf, 'num_pages', 0),
+                'num_chunks': getattr(pdf, 'num_chunks', 0),
+                'error_message': getattr(pdf, 'error_message', None),
+                'uploaded_at': pdf.uploaded_at.isoformat() if hasattr(pdf, 'uploaded_at') else None
+            })
+        
+        return JsonResponse({
+            'pdfs': pdf_list,
+            'memory_store_keys': list(processed_data_store.keys()),
+            'total_pdfs': len(pdf_list)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error listing PDFs: {e}")
+        return JsonResponse({'error': str(e)}, status=500)
+
+@require_GET
+def quick_status(request, pdf_id):
+    """Quick synchronous status check for a PDF."""
+    try:
+        pdf_doc = PDFDocument.objects.get(id=pdf_id)
+        
+        return JsonResponse({
+            'pdf_id': pdf_id,
+            'filename': pdf_doc.filename,
+            'processed': pdf_doc.processed,
+            'processing_status': getattr(pdf_doc, 'processing_status', 'unknown'),
+            'progress_percentage': getattr(pdf_doc, 'progress_percentage', 0),
+            'num_pages': getattr(pdf_doc, 'num_pages', None),
+            'num_chunks': getattr(pdf_doc, 'num_chunks', None),
+            'error_message': getattr(pdf_doc, 'error_message', None),
+            'has_memory_data': pdf_id in processed_data_store,
+            'memory_store_keys': list(processed_data_store.keys()),
+            'is_truly_ready': (
+                pdf_doc.processed and 
+                pdf_doc.processing_status == 'completed' and 
+                getattr(pdf_doc, 'num_pages', 0) > 0 and 
+                getattr(pdf_doc, 'num_chunks', 0) > 0
+            )
+        })
+        
+    except PDFDocument.DoesNotExist:
+        return JsonResponse({'error': 'PDF not found'}, status=404)
+    except Exception as e:
+        logger.error(f"Quick status error: {e}")
+        return JsonResponse({'error': str(e)}, status=500)
