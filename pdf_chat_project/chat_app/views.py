@@ -1,21 +1,15 @@
 import os
-import tempfile
-import json
-import asyncio
 import time
 import logging
 import openai
-import httpx # Import httpx
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
-
-from django.shortcuts import render, redirect
+from django.shortcuts import render
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
-from django.core.files.storage import FileSystemStorage
 from django.views.decorators.http import require_POST, require_GET
 from asgiref.sync import sync_to_async
-from botocore.exceptions import ClientError
 
 from .models import PDFDocument, ChatHistory
 from .utils import (
@@ -25,33 +19,125 @@ from .utils import (
     build_bm25_fast,
     hybrid_retrieval_optimized,
     answer_with_context_optimized,
-    load_embedding_model, # Needed for loading FAISS index
-    load_faiss_vector_store, # New function to load FAISS with deserialization allowed
+    load_faiss_vector_store,
     save_bm25_object,
     load_bm25_object,
     save_tokenized_texts,
     load_tokenized_texts,
     save_docs,
     load_docs,
-    get_faiss_index_s3_path, # For S3 path generation
-    get_s3_client, # For S3 deletion
-    s3_file_exists, # For checking S3 file existence
-    wait_for_s3_file, # For waiting on S3 file availability
-    get_pdf_s3_path # For generating S3 path for PDF files
+    get_s3_client,
+    wait_for_s3_file
 )
-from langchain_core.documents import Document
-from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+executor = ThreadPoolExecutor(max_workers=2)
 
 # In-memory store for processed PDF data (for demonstration, will need persistence for production)
 # Keyed by PDFDocument.id
 processed_data_store = {}
 
-def index(request):
+async def index(request):
     """Renders the main page with PDF upload and chat interface."""
-    pdfs = PDFDocument.objects.all().order_by('-uploaded_at')
+    pdfs = await sync_to_async(list)(PDFDocument.objects.all().order_by('-uploaded_at'))
     return render(request, 'chat_app/index.html', {'pdfs': pdfs})
+
+
+async def process_pdf_in_background(pdf_doc_id):
+    """Background processing function for PDF."""
+    try:
+        # Get PDF document
+        pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_doc_id)
+        
+        # Update status to processing
+        pdf_doc.processing_status = 'processing'
+        pdf_doc.progress_percentage = 10
+        await sync_to_async(pdf_doc.save)()
+        
+        start_time = time.time()
+        
+        # Step 1: Parse PDF (30% progress)
+        logger.info(f"Starting PDF parsing for: {pdf_doc.filename}")
+        pages_markdown = await parse_pdf_ultra_fast(pdf_doc)
+        pdf_doc.num_pages = len(pages_markdown)
+        pdf_doc.progress_percentage = 30
+        await sync_to_async(pdf_doc.save)()
+        
+        # Step 2: Chunk documents (50% progress)
+        logger.info(f"Chunking documents for: {pdf_doc.filename}")
+        docs = await sync_to_async(chunk_documents_ultra_fast)(
+            pages_markdown, pdf_doc.id, source=pdf_doc.filename
+        )
+        pdf_doc.num_chunks = len(docs)
+        pdf_doc.progress_percentage = 50
+        await sync_to_async(pdf_doc.save)()
+        
+        # Step 3: Build vector store (80% progress)
+        logger.info(f"Building vector store for: {pdf_doc.filename}")
+        
+        # Determine index base path
+        if settings.ENVIRONMENT == 'UAT_AWS':
+            index_base_path = f"faiss_indexes/{pdf_doc.id}"
+        else:
+            index_base_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id)).replace(" ", "_")
+        
+        # Build indexes in parallel using thread executor
+        def build_vectorstore():
+            return build_vector_store_fast(docs, pdf_doc.id)
+        
+        def build_bm25():
+            return build_bm25_fast(docs)
+        
+        # Run both operations concurrently
+        vectorstore_task = asyncio.get_event_loop().run_in_executor(executor, build_vectorstore)
+        bm25_task = asyncio.get_event_loop().run_in_executor(executor, build_bm25)
+        
+        vectorstore, (bm25_obj, tokenized_texts) = await asyncio.gather(vectorstore_task, bm25_task)
+        
+        pdf_doc.progress_percentage = 80
+        await sync_to_async(pdf_doc.save)()
+        
+        # Step 4: Save everything (100% progress)
+        logger.info(f"Saving processed data for: {pdf_doc.filename}")
+        
+        # Save in thread executor to avoid blocking
+        def save_all_data():
+            bm25_file_path = os.path.join(index_base_path, 'bm25.pkl')
+            tokenized_texts_file_path = os.path.join(index_base_path, 'tokenized_texts.pkl')
+            docs_file_path = os.path.join(index_base_path, 'docs.pkl')
+            
+            save_bm25_object(bm25_obj, bm25_file_path)
+            save_tokenized_texts(tokenized_texts, tokenized_texts_file_path)
+            save_docs(docs, docs_file_path)
+            
+            return bm25_file_path, tokenized_texts_file_path, docs_file_path
+        
+        bm25_path, tokenized_path, docs_path = await asyncio.get_event_loop().run_in_executor(
+            executor, save_all_data
+        )
+        
+        # Final update
+        processing_time = time.time() - start_time
+        pdf_doc.processing_time = processing_time
+        pdf_doc.processed = True
+        pdf_doc.processing_status = 'completed'
+        pdf_doc.progress_percentage = 100
+        pdf_doc.bm25_path = bm25_path
+        pdf_doc.tokenized_texts_path = tokenized_path
+        pdf_doc.docs_path = docs_path
+        await sync_to_async(pdf_doc.save)()
+        
+        logger.info(f"PDF processing completed: {pdf_doc.filename} in {processing_time:.2f}s")
+        
+    except Exception as e:
+        logger.error(f"PDF processing failed for ID {pdf_doc_id}: {e}")
+        try:
+            pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_doc_id)
+            pdf_doc.processing_status = 'failed'
+            pdf_doc.error_message = str(e)
+            await sync_to_async(pdf_doc.save)()
+        except:
+            pass
 
 @require_POST
 @csrf_exempt
@@ -134,8 +220,12 @@ async def upload_pdf(request):
             bm25_future = executor.submit(build_bm25_fast, docs)
             vector_future = executor.submit(build_vector_store_fast, docs, pdf_doc.id, index_base_path)
 
-            bm25_obj, tokenized_texts = await sync_to_async(bm25_future.result)()
-            vectorstore = await sync_to_async(vector_future.result)()
+            bm25_obj, tokenized_texts = await asyncio.get_event_loop().run_in_executor(
+                None, bm25_future.result
+            )
+            vectorstore = await asyncio.get_event_loop().run_in_executor(
+                None, vector_future.result
+            )
 
         total_time = time.time() - start_total
         pdf_doc.processing_time = total_time
@@ -379,19 +469,43 @@ async def summarize_chunk(request):
 
 
 @require_GET
+async def check_processing_status(request, pdf_id):
+    """Check PDF processing status for async operations."""
+    try:
+        pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_id)
+        return JsonResponse({
+            'status': pdf_doc.processing_status,
+            'progress': pdf_doc.progress_percentage,
+            'processed': pdf_doc.processed,
+            'error': pdf_doc.error_message,
+            'num_pages': getattr(pdf_doc, 'num_pages', 0),
+            'num_chunks': getattr(pdf_doc, 'num_chunks', 0),
+            'filename': pdf_doc.filename
+        })
+    except PDFDocument.DoesNotExist:
+        return JsonResponse({'status': 'error', 'message': 'PDF not found'}, status=404)
+    except Exception as e:
+        logger.error(f"Error checking processing status: {e}")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+@require_GET
 async def get_chat_history(request, pdf_id):
     """Retrieves chat history for a given PDF."""
     try:
         pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_id)
-        history = await sync_to_async(ChatHistory.objects.filter)(pdf_document=pdf_doc)
-        history = await sync_to_async(history.order_by)('timestamp')
+        
+        # Get chat history using sync_to_async properly
+        chat_history_qs = ChatHistory.objects.filter(pdf_document=pdf_doc).order_by('timestamp')
+        chat_history = await sync_to_async(list)(chat_history_qs)
+        
         chat_entries = []
-        async for entry in history:
+        for entry in chat_history:
             chat_entries.append({
                 'question': entry.question,
                 'answer': entry.answer,
                 'timestamp': entry.timestamp.isoformat()
             })
+        
         return JsonResponse({'status': 'success', 'history': chat_entries})
     except PDFDocument.DoesNotExist:
         return JsonResponse({'status': 'error', 'message': 'PDF document not found.'}, status=404)
@@ -406,17 +520,13 @@ async def clear_data(request):
     try:
         # Clear in-memory store
         processed_data_store.clear()
-        print("data cleared----------------------")
 
         # Delete all PDF documents and their associated files/indexes
         pdf_docs_to_delete = await sync_to_async(list)(PDFDocument.objects.all())
-        print("pdf doc deleted-----------------------")
         s3_client = None
         if settings.ENVIRONMENT == 'UAT_AWS':
             s3_client = get_s3_client()
             s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
-            print("s3 bucket-----------------------")
-            print(f"DEBUG (views.py): ENVIRONMENT is UAT_AWS. Initializing S3 client for clearing data from bucket: {s3_bucket}")
 
         for pdf_doc in pdf_docs_to_delete:
             print(f"DEBUG (views.py): Deleting data for PDF ID: {pdf_doc.id}")

@@ -79,6 +79,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'pdf_chat_project.wsgi.application'
+ASGI_APPLICATION = 'pdf_chat_project.asgi.application'
 
 
 # Database

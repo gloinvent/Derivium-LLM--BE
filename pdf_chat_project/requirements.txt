@@ -7,6 +7,7 @@ langchain-openai>=0.1.14
 pydantic==2.12.2
 typing-extensions==4.15.0
 django>=4.0
+uvicorn>=0.24.0
 
 # --- Embeddings / NLP ---
 rank-bm25>=0.2.2
