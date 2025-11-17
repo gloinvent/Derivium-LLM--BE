@@ -10,6 +10,7 @@ django>=4.0
 
 # --- Embeddings / NLP ---
 rank-bm25>=0.2.2
+sentence-transformers>=2.2.0  
 
 # --- Vector database ---
 faiss-cpu>=1.8.0
