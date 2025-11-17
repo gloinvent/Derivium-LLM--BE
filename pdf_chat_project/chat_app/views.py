@@ -59,12 +59,42 @@ async def process_pdf_in_background(pdf_doc_id):
         
         start_time = time.time()
         
+        # S3 file availability check for UAT_AWS
+        if settings.ENVIRONMENT == 'UAT_AWS':
+            s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
+            logger.info(f"Using S3 bucket: {s3_bucket}")
+
+            # Check if file exists in S3
+            storage_exists = await sync_to_async(pdf_doc.file.storage.exists)(pdf_doc.file.name)
+            
+            if not storage_exists:
+                logger.error(f"S3 upload failed: File {pdf_doc.file.name} not found in bucket {s3_bucket}.")
+                pdf_doc.processing_status = 'failed'
+                pdf_doc.error_message = 'PDF file not found in S3 storage'
+                await sync_to_async(pdf_doc.save)()
+                return
+
+            # Wait for the S3 file to become available
+            s3_available = await wait_for_s3_file(pdf_doc.file.storage, pdf_doc.file.name)
+            if not s3_available:
+                logger.error(f"S3 object '{pdf_doc.file.name}' did not become available for download.")
+                pdf_doc.processing_status = 'failed'
+                pdf_doc.error_message = 'PDF file not accessible in S3 storage'
+                await sync_to_async(pdf_doc.save)()
+                return
+        
         # Step 1: Parse PDF (30% progress)
         logger.info(f"Starting PDF parsing for: {pdf_doc.filename}")
         pages_markdown = await parse_pdf_ultra_fast(pdf_doc)
         pdf_doc.num_pages = len(pages_markdown)
         pdf_doc.progress_percentage = 30
         await sync_to_async(pdf_doc.save)()
+        
+        if not pages_markdown:
+            pdf_doc.processing_status = 'failed'
+            pdf_doc.error_message = 'PDF parsing resulted in no content'
+            await sync_to_async(pdf_doc.save)()
+            return
         
         # Step 2: Chunk documents (50% progress)
         logger.info(f"Chunking documents for: {pdf_doc.filename}")
@@ -86,7 +116,7 @@ async def process_pdf_in_background(pdf_doc_id):
         
         # Build indexes in parallel using thread executor
         def build_vectorstore():
-            return build_vector_store_fast(docs, pdf_doc.id)
+            return build_vector_store_fast(docs, pdf_doc.id, index_base_path)
         
         def build_bm25():
             return build_bm25_fast(docs)
@@ -103,21 +133,30 @@ async def process_pdf_in_background(pdf_doc_id):
         # Step 4: Save everything (100% progress)
         logger.info(f"Saving processed data for: {pdf_doc.filename}")
         
+        # Define paths for persistent storage
+        bm25_file_path = os.path.join(index_base_path, 'bm25.pkl')
+        tokenized_texts_file_path = os.path.join(index_base_path, 'tokenized_texts.pkl')
+        docs_file_path = os.path.join(index_base_path, 'docs.pkl')
+        
         # Save in thread executor to avoid blocking
         def save_all_data():
-            bm25_file_path = os.path.join(index_base_path, 'bm25.pkl')
-            tokenized_texts_file_path = os.path.join(index_base_path, 'tokenized_texts.pkl')
-            docs_file_path = os.path.join(index_base_path, 'docs.pkl')
-            
-            save_bm25_object(bm25_obj, bm25_file_path)
-            save_tokenized_texts(tokenized_texts, tokenized_texts_file_path)
-            save_docs(docs, docs_file_path)
+            save_bm25_object(bm25_obj, pdf_doc.id, bm25_file_path)
+            save_tokenized_texts(tokenized_texts, pdf_doc.id, tokenized_texts_file_path)
+            save_docs(docs, pdf_doc.id, docs_file_path)
             
             return bm25_file_path, tokenized_texts_file_path, docs_file_path
         
         bm25_path, tokenized_path, docs_path = await asyncio.get_event_loop().run_in_executor(
             executor, save_all_data
         )
+        
+        # Store processed data in memory for immediate use
+        processed_data_store[pdf_doc.id] = {
+            "docs": docs,
+            "vectorstore": vectorstore,
+            "bm25_obj": bm25_obj,
+            "tokenized_texts": tokenized_texts,
+        }
         
         # Final update
         processing_time = time.time() - start_time
@@ -133,7 +172,7 @@ async def process_pdf_in_background(pdf_doc_id):
         logger.info(f"PDF processing completed: {pdf_doc.filename} in {processing_time:.2f}s")
         
     except Exception as e:
-        logger.error(f"PDF processing failed for ID {pdf_doc_id}: {e}")
+        logger.error(f"PDF processing failed for ID {pdf_doc_id}: {e}", exc_info=True)
         try:
             pdf_doc = await sync_to_async(PDFDocument.objects.get)(id=pdf_doc_id)
             pdf_doc.processing_status = 'failed'
@@ -145,155 +184,50 @@ async def process_pdf_in_background(pdf_doc_id):
 @require_POST
 @csrf_exempt
 def upload_pdf(request):
-    """Handles PDF file upload and initiates processing."""
-    async def _upload_pdf():
+    """Handles PDF file upload and initiates background processing."""
+    try:
         if 'pdf_file' not in request.FILES:
             return JsonResponse({'status': 'error', 'message': 'No PDF file uploaded.'}, status=400)
 
         uploaded_file = request.FILES['pdf_file']
-
-        # Create a new PDFDocument instance without saving the file yet
-        pdf_doc = await sync_to_async(PDFDocument.objects.create)(
-            filename=uploaded_file.name,
-            processed=False
-        )
-        logger.info(f"PDFDocument instance created (ID: {pdf_doc.id}).")
-
-        # Assign the uploaded file to the FileField and save to trigger storage backend
-        pdf_doc.file = uploaded_file
-        await sync_to_async(pdf_doc.save)()
-        logger.info(f"PDFDocument saved. File name in DB: {pdf_doc.file.name}, URL: {pdf_doc.file.url}") # Log S3 object key and URL
         
-        if settings.ENVIRONMENT == 'UAT_AWS':
-            s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
-            print(f"DEBUG (views.py): ENVIRONMENT is UAT_AWS. Using S3 bucket: {s3_bucket}")
-            logger.info(f"Using S3 bucket: {s3_bucket}")
-
-            # Use django-storages's own storage backend to check for file existence
-            # This is more reliable as it uses the same logic that handled the upload.
-            # The pdf_doc.file.name already contains the path relative to the bucket root (e.g., 'pdfs/filename.pdf')
-            print(f"DEBUG (views.py): Checking S3 existence for {pdf_doc.file.name} via storage backend.")
-            storage_exists = await sync_to_async(pdf_doc.file.storage.exists)(pdf_doc.file.name)
-            
-            if not storage_exists:
-                print(f"ERROR (views.py): S3 upload failed: File {pdf_doc.file.name} not found by storage backend in bucket {s3_bucket}.")
-                logger.error(f"S3 upload failed: File {pdf_doc.file.name} not found by storage backend in bucket {s3_bucket}.")
-                await sync_to_async(pdf_doc.delete)() # Clean up DB entry
-                return JsonResponse({'status': 'error', 'message': 'Failed to upload PDF to S3.'}, status=500)
-            print(f"DEBUG (views.py): S3 upload confirmed for {pdf_doc.file.name} using storage.exists().")
-            logger.info(f"S3 upload confirmed for {pdf_doc.file.name} using storage.exists().")
-
-            # Wait for the S3 file to become available before proceeding with parsing
-            # Use the storage backend's exists method for consistency with upload
-            print(f"DEBUG (views.py): Waiting for S3 object '{pdf_doc.file.name}' to be available via storage backend.")
-            s3_available = await wait_for_s3_file(pdf_doc.file.storage, pdf_doc.file.name)
-            if not s3_available:
-                print(f"ERROR (views.py): S3 object '{pdf_doc.file.name}' did not become available for download.")
-                await sync_to_async(pdf_doc.delete)() # Clean up DB entry
-                return JsonResponse({'status': 'error', 'message': 'Failed to confirm PDF availability in S3.'}, status=500)
-            print(f"DEBUG (views.py): S3 object '{pdf_doc.file.name}' is now available.")
-
-        try:
-            start_total = time.time()
-            print(f"DEBUG (views.py): Starting PDF processing for PDF ID: {pdf_doc.id}")
-
-            # 1. Fast PDF parsing (utils.parse_pdf_ultra_fast now handles S3 download internally)
-            print(f"DEBUG (views.py): Calling parse_pdf_ultra_fast for PDF ID: {pdf_doc.id}")
-            pages_markdown = await parse_pdf_ultra_fast(pdf_doc)
-            pdf_doc.num_pages = len(pages_markdown)
-            print(f"DEBUG (views.py): PDF parsed. Number of pages: {pdf_doc.num_pages}")
-
-            # 2. Fast chunking with deduplication
-            print(f"DEBUG (views.py): Chunking documents for PDF ID: {pdf_doc.id}")
-            docs = chunk_documents_ultra_fast(pages_markdown, pdf_doc.id, source=uploaded_file.name)
-            pdf_doc.num_chunks = len(docs)
-            print(f"DEBUG (views.py): Documents chunked. Number of chunks: {pdf_doc.num_chunks}")
-
-            # 3. Parallel indexing
-            # Determine the base path for index files (local or S3 object key prefix)
-            if settings.ENVIRONMENT == 'UAT_AWS':
-                # For S3, paths are object keys, not file system paths
-                index_base_path = f"faiss_indexes/{pdf_doc.id}"
-                print(f"DEBUG (views.py): Index base path (S3): {index_base_path}")
-            else:
-                # For local, use MEDIA_ROOT
-                index_base_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id)).replace(" ", "_")
-                print(f"DEBUG (views.py): Index base path (Local): {index_base_path}")
-
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                bm25_future = executor.submit(build_bm25_fast, docs)
-                vector_future = executor.submit(build_vector_store_fast, docs, pdf_doc.id, index_base_path)
-
-                bm25_obj, tokenized_texts = await asyncio.get_event_loop().run_in_executor(
-                    None, bm25_future.result
-                )
-                vectorstore = await asyncio.get_event_loop().run_in_executor(
-                    None, vector_future.result
-                )
-
-            total_time = time.time() - start_total
-            pdf_doc.processing_time = total_time
-            pdf_doc.processed = True
-            await sync_to_async(pdf_doc.save)()
-            logger.info(f"PDFDocument saved. File URL: {pdf_doc.file.url}") # Log file URL
-
-            if not pages_markdown:
-                raise ValueError("PDF parsing resulted in no content.")
-
-            # Define paths for persistent storage (these will be S3 object keys or local paths)
-            bm25_file_path = os.path.join(index_base_path, 'bm25.pkl')
-            tokenized_texts_file_path = os.path.join(index_base_path, 'tokenized_texts.json')
-            docs_file_path = os.path.join(index_base_path, 'docs.json')
-
-            # Save BM25, tokenized_texts, and docs using the updated utility functions
-            await sync_to_async(save_bm25_object)(bm25_obj, pdf_doc.id, bm25_file_path)
-            await sync_to_async(save_tokenized_texts)(tokenized_texts, pdf_doc.id, tokenized_texts_file_path)
-            await sync_to_async(save_docs)(docs, pdf_doc.id, docs_file_path)
-
-            # Update PDFDocument with paths
-            pdf_doc.bm25_path = bm25_file_path
-            pdf_doc.tokenized_texts_path = tokenized_texts_file_path
-            pdf_doc.docs_path = docs_file_path
-            await sync_to_async(pdf_doc.save)()
-
-            # Store processed data in memory for immediate use (optional, can be loaded on demand)
-            processed_data_store[pdf_doc.id] = {
-                "docs": docs,
-                "vectorstore": vectorstore,
-                "bm25_obj": bm25_obj,
-                "tokenized_texts": tokenized_texts,
-            }
-
-            return JsonResponse({
-                'status': 'success',
-                'message': f'PDF "{uploaded_file.name}" processed successfully in {total_time:.2f}s.',
-                'pdf_id': pdf_doc.id,
-                'num_pages': pdf_doc.num_pages,
-                'num_chunks': pdf_doc.num_chunks,
-                'processing_time': f"{total_time:.2f}s"
-            })
-
-        except Exception as e:
-            logger.error(f"Error processing PDF: {e}", exc_info=True)
-            # Clean up the uploaded file if processing fails (only for local storage)
-            try:
-                if settings.ENVIRONMENT != 'UAT_AWS':
-                    # If a local file was saved to the model's FileField, remove it
-                    if 'pdf_doc' in locals() and getattr(pdf_doc, 'file', None):
-                        try:
-                            local_path = getattr(pdf_doc.file, 'path', None)
-                            if local_path and os.path.exists(local_path):
-                                os.remove(local_path)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            # If an error occurs after pdf_doc is created, ensure it's deleted
-            if 'pdf_doc' in locals() and pdf_doc.pk:
-                await sync_to_async(pdf_doc.delete)()
-            return JsonResponse({'status': 'error', 'message': f'Error processing PDF: {e}'}, status=500)
-    
-    return async_to_sync(_upload_pdf)()
+        # Create PDF document synchronously
+        pdf_doc = PDFDocument.objects.create(
+            filename=uploaded_file.name,
+            processed=False,
+            processing_status='uploading',
+            progress_percentage=0
+        )
+        
+        # Save file synchronously
+        pdf_doc.file = uploaded_file
+        pdf_doc.save()
+        
+        logger.info(f"PDF uploaded successfully: {pdf_doc.filename} (ID: {pdf_doc.id})")
+        
+        # Start background processing using thread executor to avoid event loop issues
+        from threading import Thread
+        def start_background_processing():
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(process_pdf_in_background(pdf_doc.id))
+            loop.close()
+        
+        thread = Thread(target=start_background_processing)
+        thread.daemon = True
+        thread.start()
+        
+        return JsonResponse({
+            'status': 'success',
+            'message': f'PDF "{uploaded_file.name}" uploaded successfully. Processing started.',
+            'pdf_id': pdf_doc.id,
+            'filename': pdf_doc.filename
+        })
+        
+    except Exception as e:
+        logger.error(f"Error uploading PDF: {e}", exc_info=True)
+        return JsonResponse({'status': 'error', 'message': f'Error uploading PDF: {str(e)}'}, status=500)
 
 @require_POST
 @csrf_exempt
