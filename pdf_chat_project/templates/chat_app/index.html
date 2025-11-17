@@ -213,31 +213,31 @@
                     uploadStatus.innerHTML = `
                         <div class="alert alert-success">
                             ${data.message}
-                            <br>Pages: ${data.num_pages}, Chunks: ${data.num_chunks}
+                            <br>Progress: ${data.progress_percentage}%
                         </div>
                     `;
-                    // Add new PDF to the list
+                    
+                    // Add new PDF to the list with proper status
+                    const statusBadge = data.display_status === 'processing' ? 
+                        '<span class="badge bg-warning text-dark">Processing...</span>' : 
+                        '<span class="badge bg-success">Processed</span>';
+                    
                     const newPdfItem = `
-                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                        <li class="list-group-item d-flex justify-content-between align-items-center" data-pdf-id="${data.pdf_id}">
                             <a href="#" class="pdf-item" data-pdf-id="${data.pdf_id}" data-pdf-name="${file.name}">
                                 ${file.name}
                             </a>
-                            <span class="badge bg-success">Processed</span>
+                            ${statusBadge}
                         </li>
                     `;
-                    pdfList.insertAdjacentHTML('afterbegin', newPdfItem); // Add to top
-                    attachPdfItemListeners(); // Re-attach listeners for new items
+                    pdfList.insertAdjacentHTML('afterbegin', newPdfItem);
+                    attachPdfItemListeners();
 
-                    // Automatically show chat interface after successful PDF processing
-                    currentPdfId = data.pdf_id;
-                    chatTitle.innerText = `Chatting with: ${file.name}`;
-                    chatInterface.style.display = 'block';
-                    // Clear previous chat results
-                    aiResponseDiv.innerHTML = '';
-                    retrievedContextDiv.innerHTML = '';
-                    chatStatus.innerHTML = '';
-                    document.getElementById('chunkSummary').style.display = 'none';
-                    document.getElementById('chunkSummary').innerHTML = '';
+                    // Start polling for status updates
+                    pollProcessingStatus(data.pdf_id, file.name);
+                    
+                    // Don't automatically show chat interface until processing is complete
+                    chatTitle.innerText = `Processing: ${file.name}`;
                 } else {
                     uploadStatus.innerHTML = `<div class="alert alert-danger">${data.message}</div>`;
                 }
@@ -481,6 +481,7 @@
                 });
             });
         }
+
     </script>
 </body>
 </html>

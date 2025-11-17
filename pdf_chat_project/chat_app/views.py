@@ -231,7 +231,10 @@ def upload_pdf(request):
             'status': 'success',
             'message': f'PDF "{uploaded_file.name}" uploaded successfully. Processing started.',
             'pdf_id': pdf_doc.id,
-            'filename': pdf_doc.filename
+            'filename': pdf_doc.filename,
+            'processing_status': 'processing',  # Add this for frontend
+            'progress_percentage': 0,           # Add this for frontend
+            'display_status': 'processing'      # Add this for frontend display
         })
         
     except Exception as e:
@@ -677,4 +680,92 @@ def quick_status(request, pdf_id):
         return JsonResponse({'error': 'PDF not found'}, status=404)
     except Exception as e:
         logger.error(f"Quick status error: {e}")
+        return JsonResponse({'error': str(e)}, status=500)
+
+@require_GET
+def pdf_status_simple(request, pdf_id):
+    """Simple endpoint to get PDF status for frontend display."""
+    try:
+        pdf_doc = PDFDocument.objects.get(id=pdf_id)
+        
+        # Determine the actual status for frontend display
+        is_ready_for_chat = (
+            pdf_doc.processed and 
+            pdf_doc.processing_status == 'completed' and 
+            getattr(pdf_doc, 'num_pages', 0) > 0 and 
+            getattr(pdf_doc, 'num_chunks', 0) > 0
+        )
+        
+        # Frontend display status
+        if pdf_doc.processing_status == 'failed':
+            display_status = 'failed'
+        elif is_ready_for_chat:
+            display_status = 'processed'
+        elif pdf_doc.processing_status in ['uploading', 'processing']:
+            display_status = 'processing'
+        else:
+            display_status = 'unknown'
+        
+        return JsonResponse({
+            'pdf_id': pdf_id,
+            'filename': pdf_doc.filename,
+            'display_status': display_status,  # Use this for frontend display
+            'is_ready_for_chat': is_ready_for_chat,
+            'processing_status': getattr(pdf_doc, 'processing_status', 'unknown'),
+            'progress_percentage': getattr(pdf_doc, 'progress_percentage', 0),
+            'num_pages': getattr(pdf_doc, 'num_pages', None),
+            'num_chunks': getattr(pdf_doc, 'num_chunks', None),
+            'error_message': getattr(pdf_doc, 'error_message', None),
+        })
+        
+    except PDFDocument.DoesNotExist:
+        return JsonResponse({'error': 'PDF not found'}, status=404)
+    except Exception as e:
+        logger.error(f"PDF status error: {e}")
+        return JsonResponse({'error': str(e)}, status=500)
+
+@require_GET
+def get_all_pdfs_status(request):
+    """Get all PDFs with their correct status for frontend display."""
+    try:
+        pdfs = PDFDocument.objects.all().order_by('-id')
+        pdf_list = []
+        
+        for pdf in pdfs:
+            # Determine the actual status for frontend display
+            is_ready_for_chat = (
+                pdf.processed and 
+                getattr(pdf, 'processing_status', '') == 'completed' and 
+                getattr(pdf, 'num_pages', 0) > 0 and 
+                getattr(pdf, 'num_chunks', 0) > 0
+            )
+            
+            # Frontend display status
+            processing_status = getattr(pdf, 'processing_status', 'unknown')
+            if processing_status == 'failed':
+                display_status = 'failed'
+            elif is_ready_for_chat:
+                display_status = 'processed'
+            elif processing_status in ['uploading', 'processing']:
+                display_status = 'processing'
+            else:
+                display_status = 'unknown'
+            
+            pdf_list.append({
+                'id': pdf.id,
+                'filename': pdf.filename,
+                'display_status': display_status,  # Frontend should use this
+                'is_ready_for_chat': is_ready_for_chat,
+                'processing_status': processing_status,
+                'progress_percentage': getattr(pdf, 'progress_percentage', 0),
+                'num_pages': getattr(pdf, 'num_pages', None),
+                'num_chunks': getattr(pdf, 'num_chunks', None),
+                'error_message': getattr(pdf, 'error_message', None),
+                'uploaded_at': pdf.uploaded_at.isoformat() if hasattr(pdf, 'uploaded_at') else None
+            })
+        
+        return JsonResponse({'pdfs': pdf_list})
+        
+    except Exception as e:
+        logger.error(f"Error getting all PDFs status: {e}")
         return JsonResponse({'error': str(e)}, status=500)
