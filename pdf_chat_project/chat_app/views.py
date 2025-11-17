@@ -529,17 +529,14 @@ async def clear_data(request):
             s3_bucket = settings.AWS_STORAGE_BUCKET_NAME
 
         for pdf_doc in pdf_docs_to_delete:
-            print(f"DEBUG (views.py): Deleting data for PDF ID: {pdf_doc.id}")
             # Delete PDF file from storage (local or S3)
             if pdf_doc.file:
-                print(f"DEBUG (views.py): Deleting PDF file {pdf_doc.file.name} from storage.")
-                await sync_to_async(pdf_doc.file.delete)(save=False) # delete file from storage
+                await sync_to_async(pdf_doc.file.delete)(save=False)
 
             # Delete FAISS index and related files
             if settings.ENVIRONMENT == 'UAT_AWS' and s3_client:
                 # List and delete all objects under the PDF's FAISS index prefix
                 prefix = f"faiss_indexes/{pdf_doc.id}/"
-                print(f"DEBUG (views.py): Deleting S3 index objects under prefix: {prefix}")
                 try:
                     response = await sync_to_async(s3_client.list_objects_v2)(Bucket=s3_bucket, Prefix=prefix)
                     if 'Contents' in response:
@@ -549,39 +546,38 @@ async def clear_data(request):
                                 Bucket=s3_bucket,
                                 Delete={'Objects': objects_to_delete, 'Quiet': True}
                             )
-                            print(f"DEBUG (views.py): Deleted {len(objects_to_delete)} S3 objects for PDF ID {pdf_doc.id} under prefix {prefix}")
                             logger.info(f"Deleted S3 objects for PDF ID {pdf_doc.id} under prefix {prefix}")
                 except Exception as e:
-                    print(f"ERROR (views.py): Error deleting S3 objects for PDF ID {pdf_doc.id}: {e}")
                     logger.error(f"Error deleting S3 objects for PDF ID {pdf_doc.id}: {e}")
             else:
                 # Local deletion
                 index_dir_path = os.path.join(settings.MEDIA_ROOT, 'faiss_indexes', str(pdf_doc.id))
                 if os.path.isdir(index_dir_path):
                     import shutil
-                    print(f"DEBUG (views.py): Deleting local FAISS index directory: {index_dir_path}")
                     await sync_to_async(shutil.rmtree)(index_dir_path)
                     logger.info(f"Deleted local FAISS index directory: {index_dir_path}")
 
-        print(f"DEBUG (views.py): Deleting all PDFDocument and ChatHistory entries from database.")
-        await sync_to_async(lambda: PDFDocument.objects.all().delete())()
-        await sync_to_async(lambda: ChatHistory.objects.all().delete())()
+        # Delete all database entries
+        def delete_all_data():
+            PDFDocument.objects.all().delete()
+            ChatHistory.objects.all().delete()
+        
+        await sync_to_async(delete_all_data)()
 
-        # Clear local media root directories if empty (only relevant for UAT_LOCAL)
+        # Clear local media root directories if empty (only relevant for local storage)
         if settings.ENVIRONMENT != 'UAT_AWS':
-            media_root = settings.MEDIA_ROOT
-            if os.path.exists(media_root) and not os.listdir(media_root):
-                print(f"DEBUG (views.py): Deleting empty local media root: {media_root}")
-                await sync_to_async(os.rmdir)(media_root)
+            def cleanup_local_dirs():
+                media_root = settings.MEDIA_ROOT
+                if os.path.exists(media_root) and not os.listdir(media_root):
+                    os.rmdir(media_root)
 
-            faiss_indexes_root = os.path.join(media_root, 'faiss_indexes')
-            if os.path.exists(faiss_indexes_root) and not os.listdir(faiss_indexes_root):
-                print(f"DEBUG (views.py): Deleting empty local FAISS indexes root: {faiss_indexes_root}")
-                await sync_to_async(os.rmdir)(faiss_indexes_root)
+                faiss_indexes_root = os.path.join(media_root, 'faiss_indexes')
+                if os.path.exists(faiss_indexes_root) and not os.listdir(faiss_indexes_root):
+                    os.rmdir(faiss_indexes_root)
+            
+            await sync_to_async(cleanup_local_dirs)()
 
-        print(f"DEBUG (views.py): All data and cache cleared successfully.")
         return JsonResponse({'status': 'success', 'message': 'All data and cache cleared.'})
     except Exception as e:
-        print(f"ERROR (views.py): Error clearing data: {e}")
         logger.error(f"Error clearing data: {e}", exc_info=True)
         return JsonResponse({'status': 'error', 'message': f'Error clearing data: {e}'}, status=500)
