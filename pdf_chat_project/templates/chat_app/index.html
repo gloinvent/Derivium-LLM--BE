@@ -482,6 +482,80 @@
             });
         }
 
+        // Function to poll processing status
+        function pollProcessingStatus(pdfId, fileName) {
+            const pollInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/check_processing_status/${pdfId}/`);
+                    const data = await response.json();
+                    
+                    // Update the PDF item status
+                    const pdfItem = document.querySelector(`[data-pdf-id="${pdfId}"]`);
+                    if (pdfItem) {
+                        const statusBadge = pdfItem.querySelector('.badge');
+                        
+                        if (data.status === 'failed') {
+                            statusBadge.className = 'badge bg-danger';
+                            statusBadge.textContent = 'Failed';
+                            uploadStatus.innerHTML = `
+                                <div class="alert alert-danger">
+                                    ❌ PDF "${fileName}" processing failed!
+                                    <br>Error: ${data.error || 'Unknown error'}
+                                </div>
+                            `;
+                            clearInterval(pollInterval);
+                        } else if (data.status === 'completed' && data.processed) {
+                            statusBadge.className = 'badge bg-success';
+                            statusBadge.textContent = 'Processed';
+                            
+                            // Update upload status with final info
+                            uploadStatus.innerHTML = `
+                                <div class="alert alert-success">
+                                    ✅ PDF "${fileName}" processed successfully!
+                                    <br>📄 Pages: ${data.num_pages}, 📦 Chunks: ${data.num_chunks}
+                                    ${data.processing_time ? `<br>⏱️ Processing time: ${data.processing_time}s` : ''}
+                                    <br><strong>Ready for chat!</strong>
+                                </div>
+                            `;
+                            
+                            clearInterval(pollInterval);
+                        } else {
+                            // Still processing
+                            statusBadge.className = 'badge bg-warning text-dark';
+                            statusBadge.textContent = `Processing... ${data.progress || 0}%`;
+                            
+                            // Update upload status with progress
+                            uploadStatus.innerHTML = `
+                                <div class="alert alert-info">
+                                    <div class="spinner-border spinner-border-sm me-2" role="status">
+                                        <span class="visually-hidden">Loading...</span>
+                                    </div>
+                                    🔄 Processing "${fileName}"... ${data.progress || 0}%
+                                    ${data.num_pages ? `<br>📄 Pages: ${data.num_pages}` : ''}
+                                    ${data.num_chunks ? `, 📦 Chunks: ${data.num_chunks}` : ''}
+                                </div>
+                            `;
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error polling status:', error);
+                    clearInterval(pollInterval);
+                    
+                    // Show error in upload status
+                    uploadStatus.innerHTML = `
+                        <div class="alert alert-warning">
+                            ⚠️ Unable to check processing status. Please refresh the page to see current status.
+                        </div>
+                    `;
+                }
+            }, 2000); // Poll every 2 seconds
+            
+            // Stop polling after 5 minutes to prevent infinite polling
+            setTimeout(() => {
+                clearInterval(pollInterval);
+            }, 300000);
+        }
+
     </script>
 </body>
 </html>
