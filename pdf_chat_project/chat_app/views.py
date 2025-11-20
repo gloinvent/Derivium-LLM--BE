@@ -92,8 +92,26 @@ async def process_pdf_in_background(pdf_doc_id):
         await sync_to_async(pdf_doc.save)()
         
         try:
-            # Use the proper async parser from utils directly
-            pages_markdown = await parse_pdf_ultra_fast(pdf_doc)
+            # Use the proper async parser from utils directly with timeout
+            logger.info(f"Starting PDF parsing with timeout for: {pdf_doc.filename}")
+            
+            # Update progress to show we're actively parsing
+            pdf_doc.progress_percentage = 20
+            await sync_to_async(pdf_doc.save)()
+            
+            # Add timeout to prevent hanging
+            try:
+                pages_markdown = await asyncio.wait_for(
+                    parse_pdf_ultra_fast(pdf_doc), 
+                    timeout=120.0  # 2 minutes timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"PDF parsing timed out after 2 minutes for {pdf_doc.filename}")
+                pages_markdown = None
+            
+            # Update progress after parsing attempt
+            pdf_doc.progress_percentage = 25
+            await sync_to_async(pdf_doc.save)()
             
             # Convert the tuple results to simple strings
             if pages_markdown and len(pages_markdown) > 0:
@@ -115,6 +133,18 @@ async def process_pdf_in_background(pdf_doc_id):
         except Exception as e:
             logger.error(f"Utils parser failed for {pdf_doc.filename}: {e}", exc_info=True)
             pages_markdown = None
+            # Still update progress even on failure
+            pdf_doc.progress_percentage = 25
+            await sync_to_async(pdf_doc.save)()
+            
+        # If the main parser failed, skip parsing entirely and proceed
+        if not pages_markdown:
+            logger.warning(f"All PDF parsing failed for {pdf_doc.filename}, proceeding without content extraction")
+            pages_markdown = [f"Content from {pdf_doc.filename}. PDF uploaded successfully but text extraction was skipped."]
+            
+            # Force progress to continue even if parsing failed
+            pdf_doc.progress_percentage = 28
+            await sync_to_async(pdf_doc.save)()
         
         # Set the correct page count and progress after parsing attempt  
         pdf_doc.num_pages = len(pages_markdown) if pages_markdown else 1
