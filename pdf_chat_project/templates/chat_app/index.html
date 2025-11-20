@@ -514,7 +514,8 @@
                         
                         // Check for completed status
                         if ((data.status === 'completed' && data.processed) || 
-                            (data.processed === true && data.progress === 100)) {
+                            (data.processed === true && data.progress === 100) ||
+                            (data.status === 'completed' && data.progress === 100)) {
                             statusBadge.className = 'badge bg-success';
                             statusBadge.textContent = 'Processed';
                             
@@ -529,11 +530,14 @@
                             `;
                             
                             clearInterval(pollInterval);
+                            console.log(`✅ Processing completed for PDF ${pdfId}: ${fileName}`);
                             return;
                         }
                         
-                        // Still processing
+                        // Still processing - be more flexible with progress detection
                         const progressPercent = data.progress || data.progress_percentage || 0;
+                        const statusText = data.status || 'processing';
+                        
                         statusBadge.className = 'badge bg-warning text-dark';
                         statusBadge.textContent = `Processing... ${progressPercent}%`;
                         
@@ -543,7 +547,7 @@
                                 <div class="spinner-border spinner-border-sm me-2" role="status">
                                     <span class="visually-hidden">Loading...</span>
                                 </div>
-                                🔄 Processing "${fileName}"... ${progressPercent}%
+                                🔄 Processing "${fileName}"... ${progressPercent}% (${statusText})
                                 ${data.num_pages ? `<br>📄 Pages: ${data.num_pages}` : ''}
                                 ${data.num_chunks ? `, 📦 Chunks: ${data.num_chunks}` : ''}
                             </div>
@@ -565,7 +569,33 @@
             // Stop polling after 5 minutes to prevent infinite polling
             setTimeout(() => {
                 clearInterval(pollInterval);
-                console.log(`Stopped polling for PDF ${pdfId} after 5 minutes`);
+                console.log(`⏰ Stopped polling for PDF ${pdfId} after 5 minutes`);
+                
+                // Check one more time if it's actually completed
+                fetch(`/check_processing_status/${pdfId}/`)
+                    .then(response => response.json())
+                    .then(data => {
+                        if ((data.status === 'completed' && data.processed) || 
+                            (data.processed === true && data.progress === 100) ||
+                            (data.status === 'completed' && data.progress === 100)) {
+                            
+                            const pdfItem = document.querySelector(`[data-pdf-id="${pdfId}"]`);
+                            if (pdfItem) {
+                                const statusBadge = pdfItem.querySelector('.badge');
+                                statusBadge.className = 'badge bg-success';
+                                statusBadge.textContent = 'Processed';
+                            }
+                            
+                            uploadStatus.innerHTML = `
+                                <div class="alert alert-success">
+                                    ✅ PDF "${fileName}" completed after timeout check!
+                                    <br><strong>Ready for chat!</strong>
+                                </div>
+                            `;
+                        }
+                    })
+                    .catch(error => console.error('Final status check failed:', error));
+                    
             }, 300000);
         }
 
