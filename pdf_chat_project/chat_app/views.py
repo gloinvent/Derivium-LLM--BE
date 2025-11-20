@@ -115,51 +115,50 @@ async def process_pdf_in_background(pdf_doc_id):
         watchdog_task = asyncio.create_task(progress_watchdog())
         
         try:
-            # Skip PDF parsing entirely for problematic PDFs and proceed immediately
-            logger.info(f"Bypassing PDF parsing completely for faster processing: {pdf_doc.filename}")
+            # Actually parse the PDF instead of skipping it
+            logger.info(f"Starting PDF parsing for: {pdf_doc.filename}")
             
-            # Update progress to show we're skipping parsing
+            # Update progress to show we're starting parsing
             pdf_doc.progress_percentage = 20
             await sync_to_async(pdf_doc.save)()
             
-            # Create immediate fallback content without trying to parse
-            logger.info(f"Creating immediate fallback content for: {pdf_doc.filename}")
-            
-            # Create simple fallback content based on filename
-            filename_clean = pdf_doc.filename.replace('.pdf', '').replace('_', ' ').replace('-', ' ')
-            pages_markdown = [
-                f"Document: {pdf_doc.filename}\n\nThis PDF contains content related to: {filename_clean}\n\nThe document was uploaded successfully. Text extraction was bypassed for faster processing. You can ask questions about topics that might be covered in such documents."
-            ]
+            # Parse the PDF content using the utility function
+            pages_markdown = await sync_to_async(parse_pdf_ultra_fast)(pdf_doc.file.path)
             
             # Force immediate progress to 25%
-            pdf_doc.progress_percentage = 25
+            pdf_doc.progress_percentage = 30
             await sync_to_async(pdf_doc.save)()
-            logger.info(f"Created immediate content for {pdf_doc.filename}, moving to chunking")
+            logger.info(f"PDF parsing completed for {pdf_doc.filename}, extracted {len(pages_markdown) if pages_markdown else 0} pages")
                 
         except Exception as e:
-            logger.error(f"Even fallback content creation failed for {pdf_doc.filename}: {e}", exc_info=True)
-            pages_markdown = [f"Content from {pdf_doc.filename}"]
+            logger.error(f"PDF parsing failed for {pdf_doc.filename}: {e}", exc_info=True)
+            # Create fallback content only if parsing completely fails
+            filename_clean = pdf_doc.filename.replace('.pdf', '').replace('_', ' ').replace('-', ' ')
+            pages_markdown = [
+                f"Document: {pdf_doc.filename}\n\nThis PDF contains content related to: {filename_clean}\n\nThe document was uploaded successfully but text extraction failed. You can ask questions about topics that might be covered in such documents, though specific content may not be available."
+            ]
             # Force progress update
-            pdf_doc.progress_percentage = 25
+            pdf_doc.progress_percentage = 30
             await sync_to_async(pdf_doc.save)()
             
-        # If parsing completely failed, skip it entirely and proceed immediately
-        if not pages_markdown:
-            logger.warning(f"All PDF parsing failed for {pdf_doc.filename}, creating immediate fallback content")
+        # If parsing failed but we still have some content, check if it's meaningful
+        if not pages_markdown or all(len(page.strip()) < 10 for page in pages_markdown):
+            logger.warning(f"No meaningful content extracted from PDF {pdf_doc.filename}, creating fallback content")
             
             # Create simple fallback content based on filename
             filename_clean = pdf_doc.filename.replace('.pdf', '').replace('_', ' ').replace('-', ' ')
             pages_markdown = [
-                f"Document: {pdf_doc.filename}\n\nThis PDF contains content related to: {filename_clean}\n\nThe document was uploaded successfully but text extraction was bypassed for faster processing. You can ask questions about topics that might be covered in such documents."
+                f"Document: {pdf_doc.filename}\n\nThis PDF contains content related to: {filename_clean}\n\nThe document was uploaded successfully but text extraction yielded minimal content. This might be a scanned PDF or contain primarily images. You can ask questions about topics that might be covered in such documents."
             ]
             
-            # Force progress to continue immediately
-            pdf_doc.progress_percentage = 28
+            # Force progress to continue
+            pdf_doc.progress_percentage = 32
             await sync_to_async(pdf_doc.save)()
-            logger.info(f"Created immediate fallback content for {pdf_doc.filename}")
+            logger.info(f"Created fallback content for {pdf_doc.filename} due to minimal extraction")
         
         # Always ensure we have some content to proceed with
-        if not pages_markdown:
+        if not pages_markdown or all(len(page.strip()) < 5 for page in pages_markdown):
+            logger.warning(f"Final check: No usable content for {pdf_doc.filename}, creating minimal content")
             pages_markdown = [f"Content from {pdf_doc.filename}"]
         
         # Cancel watchdog since we're proceeding
@@ -187,32 +186,38 @@ async def process_pdf_in_background(pdf_doc_id):
             pages_markdown = [f"This PDF ({pdf_doc.filename}) was uploaded successfully. The content could not be extracted - this may be a scanned PDF. You can ask general questions about the document."]
             pdf_doc.num_pages = 1
         
-        # Step 2: Create simple chunks (50% progress) - Bypass complex chunking to avoid errors
-        logger.info(f"Creating simple chunks for: {pdf_doc.filename}")
+        # Step 2: Create chunks from extracted content (50% progress)
+        logger.info(f"Starting chunking for: {pdf_doc.filename}")
         
         # Update progress to show we're moving to chunking
         pdf_doc.progress_percentage = 35
         await sync_to_async(pdf_doc.save)()
         
         try:
-            # Create simple document chunks directly instead of using complex chunking
-            docs = []
-            for i, page_content in enumerate(pages_markdown):
-                # Create a simple document-like object
-                doc = {
-                    'page_content': page_content,
-                    'metadata': {
-                        'source': pdf_doc.filename,
-                        'page': i + 1,
-                        'chunk_length': len(page_content)
+            # Use proper chunking if we have real content
+            if pages_markdown and any(len(page.strip()) > 100 for page in pages_markdown):
+                logger.info(f"Using proper chunking for {pdf_doc.filename} with real content")
+                docs = await sync_to_async(chunk_documents_ultra_fast)(pages_markdown, pdf_doc.filename)
+            else:
+                logger.info(f"Using simple chunking for {pdf_doc.filename} with minimal content")
+                # Create simple document chunks for minimal content
+                docs = []
+                for i, page_content in enumerate(pages_markdown):
+                    # Create a simple document-like object
+                    doc = {
+                        'page_content': page_content,
+                        'metadata': {
+                            'source': pdf_doc.filename,
+                            'page': i + 1,
+                            'chunk_length': len(page_content)
+                        }
                     }
-                }
-                docs.append(doc)
+                    docs.append(doc)
             
-            # If no content, create at least one chunk
+            # Ensure we have at least one chunk
             if not docs:
                 docs = [{
-                    'page_content': f"Document: {pdf_doc.filename}\n\nThis PDF has been uploaded successfully with OCR disabled for faster processing.",
+                    'page_content': f"Document: {pdf_doc.filename}\n\nThis PDF has been uploaded successfully.",
                     'metadata': {
                         'source': pdf_doc.filename,
                         'page': 1,
@@ -223,13 +228,13 @@ async def process_pdf_in_background(pdf_doc_id):
             pdf_doc.num_chunks = len(docs)
             pdf_doc.progress_percentage = 50
             await sync_to_async(pdf_doc.save)()
-            logger.info(f"Created simple chunks for {pdf_doc.filename}. Chunks: {pdf_doc.num_chunks}")
+            logger.info(f"Chunking completed for {pdf_doc.filename}. Chunks: {pdf_doc.num_chunks}")
                 
         except Exception as e:
-            logger.error(f"Simple chunking failed for {pdf_doc.filename}: {e}", exc_info=True)
+            logger.error(f"Chunking failed for {pdf_doc.filename}: {e}", exc_info=True)
             # Create absolute minimal fallback
             docs = [{
-                'page_content': f"PDF document: {pdf_doc.filename} (processed with OCR disabled)",
+                'page_content': f"PDF document: {pdf_doc.filename}",
                 'metadata': {'source': pdf_doc.filename, 'page': 1, 'chunk_length': 50}
             }]
             pdf_doc.num_chunks = 1
@@ -640,13 +645,14 @@ def chat(request):
                     content = str(candidate)
                     
                 # Check if content is not placeholder/fallback content
-                if (not content.startswith('# Document:') and 
+                if (not content.startswith('Document:') and 
                     not content.startswith('This PDF document has been uploaded') and
                     not content.startswith('This PDF (') and
                     not content.startswith('PDF document:') and
                     'was uploaded successfully' not in content and
-                    'OCR disabled for faster processing' not in content and
-                    len(content.strip()) > 100):  # Substantial content
+                    'text extraction was bypassed' not in content and
+                    'text extraction failed' not in content and
+                    len(content.strip()) > 50):  # Reduced threshold for real content
                     has_real_content = True
                     break
             
@@ -660,22 +666,21 @@ def chat(request):
                 # Generate helpful response for placeholder content
                 logger.info(f"Processing placeholder content for PDF {pdf_id}")
                 filename = pdf_doc.filename
-                answer = f"""I can see that "{filename}" has been uploaded, but detailed text extraction was limited due to OCR being disabled for faster processing.
+                answer = f"""I can see that "{filename}" has been uploaded, but I wasn't able to extract detailed text content from this PDF.
 
 Based on your question: "{query}"
 
-Since this appears to be related to "{filename.replace('.pdf', '').replace('_', ' ').replace('-', ' ')}", I can provide some general guidance:
+This could be due to:
+1. **Image-based PDF**: The PDF might contain scanned images rather than searchable text
+2. **Complex formatting**: The document might have complex layouts that make text extraction difficult
+3. **Protected content**: The PDF might have restrictions on text extraction
 
-1. **Document Structure**: The PDF was successfully uploaded and processed, but contains primarily image-based content or complex formatting.
+**Suggestions:**
+- Try uploading a different version of the PDF if available
+- If this is a scanned document, consider using OCR software first
+- Check if the PDF contains searchable text by trying to select/copy text manually
 
-2. **Regarding your question**: While I cannot access the specific text content, documents with similar names often contain relevant information about the topic you're asking about.
-
-3. **Suggestions**: 
-   - Try asking more general questions about the subject matter
-   - If you need specific text content, consider re-uploading with OCR enabled
-   - Ask about common topics that might be covered in such documents
-
-Would you like me to provide general information about the topic based on the document name, or would you prefer to ask a different type of question?"""
+Would you like to try uploading a different PDF or ask a different question?"""
                 
                 # Create meaningful chunk data even for placeholder content
                 chunk_data = []
