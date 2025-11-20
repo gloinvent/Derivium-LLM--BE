@@ -373,6 +373,7 @@ async def process_pdf_in_background(pdf_doc_id):
         except:
             pass
 
+
 @require_POST
 @csrf_exempt
 def upload_pdf(request):
