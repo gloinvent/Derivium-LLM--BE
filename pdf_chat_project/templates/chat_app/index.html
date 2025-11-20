@@ -523,7 +523,7 @@
                                 <div class="alert alert-success">
                                     ✅ PDF "${fileName}" processed successfully!
                                     <br>📄 Pages: ${data.num_pages || 'N/A'}, 📦 Chunks: ${data.num_chunks || 'N/A'}
-                                    ${data.processing_time ? `<br>⏱️ Processing time: ${data.processing_time}s` : ''}
+                                    ${data.processing_time ? `<br>⏱️ Processing time: ${Math.round(data.processing_time)}s` : ''}
                                     <br><strong>Ready for chat!</strong>
                                 </div>
                             `;
