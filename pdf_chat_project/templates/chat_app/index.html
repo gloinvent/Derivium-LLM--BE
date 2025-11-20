@@ -145,6 +145,18 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        // Add HTML escaping function
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Add function to safely encode for data attributes
+        function safeEncode(text) {
+            return encodeURIComponent(text).replace(/'/g, '%27').replace(/"/g, '%22');
+        }
+
         const processPdfBtn = document.getElementById('processPdfBtn');
         const pdfFile = document.getElementById('pdfFile');
         const uploadStatus = document.getElementById('uploadStatus');
@@ -160,6 +172,7 @@
         const clearDataBtn = document.getElementById('clearDataBtn');
 
         let currentPdfId = null;
+        let pollingIntervals = {}; // Track polling intervals to prevent leaks
 
         // CSRF token for Django POST requests
         function getCookie(name) {
@@ -183,6 +196,19 @@
             const file = pdfFile.files[0];
             if (!file) {
                 uploadStatus.innerHTML = '<div class="alert alert-warning">Please select a PDF file.</div>';
+                return;
+            }
+
+            // Validate file type
+            if (!file.name.toLowerCase().endsWith('.pdf')) {
+                uploadStatus.innerHTML = '<div class="alert alert-danger">Please select a valid PDF file.</div>';
+                return;
+            }
+
+
+            // Check if file is empty
+            if (file.size === 0) {
+                uploadStatus.innerHTML = '<div class="alert alert-danger">Selected file is empty.</div>';
                 return;
             }
 
@@ -224,8 +250,8 @@
                     
                     const newPdfItem = `
                         <li class="list-group-item d-flex justify-content-between align-items-center" data-pdf-id="${data.pdf_id}">
-                            <a href="#" class="pdf-item" data-pdf-id="${data.pdf_id}" data-pdf-name="${file.name}">
-                                ${file.name}
+                            <a href="#" class="pdf-item" data-pdf-id="${data.pdf_id}" data-pdf-name="${escapeHtml(file.name)}">
+                                ${escapeHtml(file.name)}
                             </a>
                             ${statusBadge}
                         </li>
@@ -255,6 +281,13 @@
                 chatStatus.innerHTML = '<div class="alert alert-warning">Please enter a question.</div>';
                 return;
             }
+            
+            // Validate query length
+            if (query.length > 1000) {
+                chatStatus.innerHTML = '<div class="alert alert-warning">Question is too long. Please limit to 1000 characters.</div>';
+                return;
+            }
+            
             console.log("Query from chatQueryInput:", query);
             if (!currentPdfId) {
                 chatStatus.innerHTML = '<div class="alert alert-warning">Please select a PDF first.</div>';
@@ -305,19 +338,19 @@
                             <div class="card-header" id="headingChunk${index}">
                                 <h2 class="mb-0">
                                     <button class="btn btn-link w-100 text-start" type="button" data-bs-toggle="collapse" data-bs-target="#collapseChunk${index}" aria-expanded="false" aria-controls="collapseChunk${index}">
-                                        <strong>Option ${index + 1}</strong> (Pages: ${ctx.page})
+                                        <strong>Option ${index + 1}</strong> (Pages: ${escapeHtml(ctx.page)})
                                     </button>
                                 </h2>
                             </div>
                             <div id="collapseChunk${index}" class="collapse" aria-labelledby="headingChunk${index}" data-bs-parent="#retrievedContext">
                                 <div class="card-body">
-                                    <p>${ctx.content}</p>
+                                    <p>${escapeHtml(ctx.content)}</p>
                                     <button class="btn btn-info mt-1 summarize-chunk-btn"
                                             style="padding: 8px 12px; font-size: 1.2em;"
                                             data-pdf-id="${currentPdfId}"
-                                            data-chunk-content="${encodeURIComponent(ctx.content)}"
-                                            data-chunk-page="${ctx.original_page}" {# Use original_page for summarization #}
-                                            data-query="${encodeURIComponent(query)}">
+                                            data-chunk-content="${safeEncode(ctx.content)}"
+                                            data-chunk-page="${escapeHtml(ctx.original_page)}" 
+                                            data-query="${safeEncode(query)}">
                                       👍
                                     </button>
                                 </div>
@@ -377,6 +410,12 @@
                     document.getElementById('chunkSummary').style.display = 'none';
                     document.getElementById('chunkSummary').innerHTML = '';
                     pdfFile.value = ''; // Clear the file input
+                    
+                    // Clear all polling intervals
+                    Object.keys(pollingIntervals).forEach(pdfId => {
+                        clearInterval(pollingIntervals[pdfId]);
+                        delete pollingIntervals[pdfId];
+                    });
                 } else {
                     uploadStatus.innerHTML = `<div class="alert alert-danger">${data.message}</div>`;
                 }
@@ -409,6 +448,21 @@
 
         // Initial attachment of listeners
         attachPdfItemListeners();
+        
+        // Add Enter key handler for chat input
+        chatQueryInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey && !getAnswerBtn.disabled) {
+                e.preventDefault();
+                getAnswerBtn.click();
+            }
+        });
+        
+        // Clear intervals when page is unloaded to prevent memory leaks
+        window.addEventListener('beforeunload', function() {
+            Object.keys(pollingIntervals).forEach(pdfId => {
+                clearInterval(pollingIntervals[pdfId]);
+            });
+        });
     </script>
     <script>
         async function generateChunkSummary(pdfId, chunkContent, chunkPage, query) {
@@ -440,11 +494,11 @@
 
                 if (data.status === 'success') {
                     chunkSummaryDiv.innerHTML = `
-                        <h6>Summary for Pages: ${chunkPage}</h6>
-                        <p>${data.summary}</p>
+                        <h6>Summary for Pages: ${escapeHtml(chunkPage)}</h6>
+                        <p>${escapeHtml(data.summary)}</p>
                     `;
                 } else {
-                    chunkSummaryDiv.innerHTML = `<div class="alert alert-danger">${data.message}</div>`;
+                    chunkSummaryDiv.innerHTML = `<div class="alert alert-danger">${escapeHtml(data.message)}</div>`;
                 }
             } catch (error) {
                 console.error('Error generating chunk summary:', error);
@@ -486,6 +540,12 @@
         function pollProcessingStatus(pdfId, fileName) {
             console.log(`Starting to poll processing status for PDF ${pdfId}: ${fileName}`);
             
+            // Clear any existing interval for this PDF
+            if (pollingIntervals[pdfId]) {
+                clearInterval(pollingIntervals[pdfId]);
+                delete pollingIntervals[pdfId];
+            }
+            
             const pollInterval = setInterval(async () => {
                 try {
                     const response = await fetch(`/check_processing_status/${pdfId}/`);
@@ -508,7 +568,8 @@
                                     <br>Error: ${data.error || data.message || 'Unknown error'}
                                 </div>
                             `;
-                            clearInterval(pollInterval);
+                            clearInterval(pollingIntervals[pdfId]);
+                            delete pollingIntervals[pdfId];
                             return;
                         }
                         
@@ -529,7 +590,8 @@
                                 </div>
                             `;
                             
-                            clearInterval(pollInterval);
+                            clearInterval(pollingIntervals[pdfId]);
+                            delete pollingIntervals[pdfId];
                             console.log(`✅ Processing completed for PDF ${pdfId}: ${fileName}`);
                             return;
                         }
@@ -555,7 +617,8 @@
                     }
                 } catch (error) {
                     console.error('Error polling status:', error);
-                    clearInterval(pollInterval);
+                    clearInterval(pollingIntervals[pdfId]);
+                    delete pollingIntervals[pdfId];
                     
                     // Show error in upload status
                     uploadStatus.innerHTML = `
@@ -566,9 +629,15 @@
                 }
             }, 2000); // Poll every 2 seconds
             
+            // Store the interval ID
+            pollingIntervals[pdfId] = pollInterval;
+            
             // Stop polling after 5 minutes to prevent infinite polling
             setTimeout(() => {
-                clearInterval(pollInterval);
+                if (pollingIntervals[pdfId]) {
+                    clearInterval(pollingIntervals[pdfId]);
+                    delete pollingIntervals[pdfId];
+                }
                 console.log(`⏰ Stopped polling for PDF ${pdfId} after 5 minutes`);
                 
                 // Check one more time if it's actually completed
