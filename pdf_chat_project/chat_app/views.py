@@ -462,11 +462,6 @@ def upload_pdf(request):
         if not uploaded_file.name.lower().endswith('.pdf'):
             return JsonResponse({'status': 'error', 'message': 'Only PDF files are allowed.'}, status=400)
         
-        # Check file size (10MB limit)
-        max_size = 10 * 1024 * 1024  # 10MB
-        if uploaded_file.size > max_size:
-            return JsonResponse({'status': 'error', 'message': 'File size exceeds 10MB limit.'}, status=400)
-        
         # Check if file is not empty
         if uploaded_file.size == 0:
             return JsonResponse({'status': 'error', 'message': 'Uploaded file is empty.'}, status=400)
